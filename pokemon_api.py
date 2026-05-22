@@ -1,25 +1,32 @@
 # pokemon_api.py
 # ---------------------------------------------------------------------------
-# Pokémon Card Price Checker — backend (single-file, simple architecture).
+# Pokémon Card Price Checker — backend.
 #
-# How it works:
-#   1. A search checks the local SQLite database.
-#   2. FRESHNESS CHECK: if matching cards exist AND were fetched within the
-#      last 7 days, serve them from the DB (fast).
-#   3. Otherwise (no data, or stale data) re-fetch from the Pokémon TCG API
-#      using a wildcard query, save with a fresh timestamp, and serve.
-#
-#   This means the DB self-heals — stale data or changed fetch logic
-#   refreshes automatically. No manual database deletes needed.
+# Includes:
+#   - Card search (Pokémon TCG API + local DB cache, with freshness TTL)
+#   - Autocomplete name suggestions
+#   - Per-user WATCHLIST, stored in the database, protected by Clerk auth
 # ---------------------------------------------------------------------------
 
 import os
 import csv
+import json
 import sqlite3
 import requests
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# Load variables from the .env file (gives us CLERK_SECRET_KEY).
+load_dotenv()
+
+# Clerk SDK — used to verify that a request really comes from a logged-in user.
+from clerk_backend_api import Clerk
+from clerk_backend_api.security.types import AuthenticateRequestOptions
+import httpx
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -30,16 +37,19 @@ POKEMON_TCG_API = "https://api.pokemontcg.io/v2/cards"
 PAGE_SIZE = 250
 MAX_PAGES = 20
 REQUEST_TIMEOUT = 20
-
-# How long cached card data stays "fresh" before we re-fetch it.
-# 7 days is a reasonable balance: prices don't change wildly day-to-day,
-# and repeat searches within a week stay instant.
 FRESHNESS_DAYS = 7
 
 API_KEY = os.environ.get("POKEMON_TCG_API_KEY", "")
+CLERK_SECRET_KEY = os.environ.get("CLERK_SECRET_KEY", "")
+
+if not CLERK_SECRET_KEY:
+    print("WARNING: CLERK_SECRET_KEY not set — watchlist endpoints will fail.")
+
+# The Clerk client, used to verify login tokens.
+clerk_client = Clerk(bearer_auth=CLERK_SECRET_KEY)
 
 
-app = FastAPI(title="Pokemon Card Price API", version="1.2")
+app = FastAPI(title="Pokemon Card Price API", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,7 +66,6 @@ app.add_middleware(
 
 
 def load_pokemon_names() -> list[str]:
-    """Read unique Pokémon names from Pokemon.csv (for the autocomplete)."""
     names: list[str] = []
     seen = set()
     try:
@@ -82,13 +91,10 @@ POKEMON_NAMES = load_pokemon_names()
 
 
 def init_db() -> None:
-    """
-    Create the cards table if it doesn't exist.
-
-    The `last_updated` column stores an ISO timestamp of when each card
-    was last fetched from the API. This powers the freshness (TTL) check.
-    """
+    """Create the cards table and the watchlist table if they don't exist."""
     conn = sqlite3.connect(DATABASE)
+
+    # Cards cache table (unchanged).
     conn.execute("""
         CREATE TABLE IF NOT EXISTS cards (
             card_id       TEXT PRIMARY KEY,
@@ -103,6 +109,21 @@ def init_db() -> None:
         )
         """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pokemon_name ON cards(pokemon_name)")
+
+    # NEW: watchlist table — one row per (user, card).
+    # user_id is the Clerk user ID. card_json stores the full card so we
+    # can show it without re-fetching.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist (
+            user_id    TEXT NOT NULL,
+            card_id    TEXT NOT NULL,
+            card_json  TEXT NOT NULL,
+            added_at   TEXT NOT NULL,
+            PRIMARY KEY (user_id, card_id)
+        )
+        """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_user ON watchlist(user_id)")
+
     conn.commit()
     conn.close()
 
@@ -111,22 +132,63 @@ init_db()
 
 
 # ---------------------------------------------------------------------------
-# HELPERS
+# CLERK AUTH HELPER
+# ---------------------------------------------------------------------------
+
+
+def get_user_id(authorization: str | None) -> str:
+    """
+    Verify the Clerk token from the Authorization header and return the
+    user's Clerk ID. Raises 401 if the token is missing or invalid.
+
+    The frontend sends:  Authorization: Bearer <clerk-token>
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not signed in.")
+
+    token = authorization.split(" ", 1)[1]
+
+    # Clerk verifies the token. We wrap it in a minimal httpx.Request
+    # because that's what the SDK expects.
+    try:
+        fake_request = httpx.Request(
+            method="GET",
+            url="http://localhost",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        state = clerk_client.authenticate_request(
+            fake_request,
+            AuthenticateRequestOptions(),
+        )
+    except Exception as e:
+        print(f"Clerk token verification error: {e}")
+        raise HTTPException(status_code=401, detail="Invalid session.")
+
+    if not state.is_signed_in:
+        raise HTTPException(status_code=401, detail="Invalid session.")
+
+    # The user's Clerk ID lives in the token's "sub" claim.
+    user_id = (state.payload or {}).get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Could not identify user.")
+
+    return user_id
+
+
+# ---------------------------------------------------------------------------
+# CARD SEARCH HELPERS  (unchanged from before)
 # ---------------------------------------------------------------------------
 
 
 def _now_iso() -> str:
-    """Current UTC time as an ISO string — used for the last_updated stamp."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def _api_headers() -> dict:
-    """Return request headers, including the API key if one is set."""
     return {"X-Api-Key": API_KEY} if API_KEY else {}
 
 
 def extract_market_price(card: dict) -> float:
-    """Pull a market price out of the TCG API's nested price data."""
     tcgplayer = card.get("tcgplayer") or {}
     prices = tcgplayer.get("prices") or {}
     for price_data in prices.values():
@@ -138,7 +200,6 @@ def extract_market_price(card: dict) -> float:
 
 
 def _row_from_api_card(card: dict) -> dict | None:
-    """Convert one raw API card into our database row shape. None if invalid."""
     card_id = card.get("id")
     if not card_id:
         return None
@@ -157,14 +218,6 @@ def _row_from_api_card(card: dict) -> dict | None:
 
 
 def is_data_fresh(name: str) -> bool:
-    """
-    Return True if we have matching cards in the DB that were fetched
-    within the last FRESHNESS_DAYS days.
-
-    We check the OLDEST matching card's timestamp — if even the oldest
-    is still fresh, the whole set is fresh. If there are no matching
-    cards at all, it's not fresh (we need to fetch).
-    """
     conn = sqlite3.connect(DATABASE)
     try:
         cursor = conn.cursor()
@@ -176,28 +229,17 @@ def is_data_fresh(name: str) -> bool:
     finally:
         conn.close()
 
-    # No matching cards, or a row with no timestamp → treat as stale.
     if not oldest:
         return False
-
     try:
         oldest_dt = datetime.fromisoformat(oldest)
     except ValueError:
-        return False  # unparseable timestamp → re-fetch to be safe
-
+        return False
     cutoff = datetime.now(timezone.utc) - timedelta(days=FRESHNESS_DAYS)
     return oldest_dt >= cutoff
 
 
 def fetch_from_api(name: str) -> int:
-    """
-    Fetch ALL matching cards from the Pokémon TCG API and save them.
-
-    Wildcard query name:"*term*" catches every variant (Mewtwo, Mewtwo ex,
-    Mewtwo VSTAR, etc.). Each saved card gets a fresh `last_updated` stamp.
-
-    Returns the number of cards fetched.
-    """
     timestamp = _now_iso()
     query_string = f'name:"*{name}*"'
     total = 0
@@ -235,7 +277,6 @@ def fetch_from_api(name: str) -> int:
                 row = _row_from_api_card(card)
                 if row is None:
                     continue
-
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO cards
@@ -276,7 +317,6 @@ def query_local_db(
     min_price: float,
     max_price: float,
 ) -> list[dict]:
-    """Search the local SQLite database with filters and sorting applied."""
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     try:
@@ -312,7 +352,24 @@ def query_local_db(
 
 
 # ---------------------------------------------------------------------------
-# ROUTES
+# REQUEST MODELS
+# ---------------------------------------------------------------------------
+
+
+class WatchCardIn(BaseModel):
+    """The card data the frontend sends when adding to the watchlist."""
+
+    card_id: str
+    pokemon_name: str
+    set_name: str | None = ""
+    rarity: str | None = ""
+    market_price: float | None = 0
+    small_image: str | None = ""
+    large_image: str | None = ""
+
+
+# ---------------------------------------------------------------------------
+# ROUTES — search (unchanged)
 # ---------------------------------------------------------------------------
 
 
@@ -323,17 +380,16 @@ def root():
 
 @app.get("/health")
 def health():
-    """Simple health check."""
     return {
         "status": "ok",
         "api_key_set": bool(API_KEY),
+        "clerk_key_set": bool(CLERK_SECRET_KEY),
         "freshness_days": FRESHNESS_DAYS,
     }
 
 
 @app.get("/pokemon-names")
 def pokemon_names(q: str = ""):
-    """Return Pokémon names for the autocomplete dropdown (max 8)."""
     query = q.strip().lower()
     if not query:
         return {"names": []}
@@ -349,15 +405,6 @@ def search_cards(
     min_price: float = 0,
     max_price: float = 999999,
 ):
-    """
-    Search for Pokémon cards.
-
-    Freshness logic:
-      - If we have matching cards fetched within the last FRESHNESS_DAYS,
-        serve them straight from the DB (fast).
-      - Otherwise, re-fetch from the API, save with a fresh timestamp,
-        then serve. This makes the DB self-healing — no manual deletes.
-    """
     name = name.strip()
     if not name:
         return {"cards": []}
@@ -370,3 +417,75 @@ def search_cards(
 
     results = query_local_db(name, rarity, sort, min_price, max_price)
     return {"cards": results, "count": len(results)}
+
+
+# ---------------------------------------------------------------------------
+# ROUTES — watchlist (NEW, require a signed-in user)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/watchlist")
+def get_watchlist(authorization: str | None = Header(default=None)):
+    """Return the signed-in user's watchlist."""
+    user_id = get_user_id(authorization)
+
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT card_json FROM watchlist WHERE user_id = ? ORDER BY added_at",
+            (user_id,),
+        )
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    cards = [json.loads(row["card_json"]) for row in rows]
+    return {"cards": cards, "count": len(cards)}
+
+
+@app.post("/watchlist/add")
+def add_to_watchlist(
+    card: WatchCardIn,
+    authorization: str | None = Header(default=None),
+):
+    """Add a card to the signed-in user's watchlist."""
+    user_id = get_user_id(authorization)
+
+    conn = sqlite3.connect(DATABASE)
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO watchlist
+            (user_id, card_id, card_json, added_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (user_id, card.card_id, card.model_dump_json(), _now_iso()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"status": "added", "card_id": card.card_id}
+
+
+@app.delete("/watchlist/remove/{card_id}")
+def remove_from_watchlist(
+    card_id: str,
+    authorization: str | None = Header(default=None),
+):
+    """Remove a card from the signed-in user's watchlist."""
+    user_id = get_user_id(authorization)
+
+    conn = sqlite3.connect(DATABASE)
+    try:
+        conn.execute(
+            "DELETE FROM watchlist WHERE user_id = ? AND card_id = ?",
+            (user_id, card_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"status": "removed", "card_id": card_id}

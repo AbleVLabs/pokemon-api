@@ -1,6 +1,9 @@
 {
   "scripts": {
-    "dev": "concurrently \"uvicorn main:app --reload\" \"cd frontend && npm run dev\""
+    "predev": "taskkill /F /IM python.exe /T 2>nul & exit 0",
+    "dev": "concurrently --kill-others --names \"API,WEB\" --prefix-colors \"yellow,cyan\" \"uvicorn main:app --reload --port 8000\" \"cd frontend && npm run dev\"",
+    "backend": "uvicorn main:app --reload --port 8000",
+    "frontend": "cd frontend && npm run dev"
   },
   "devDependencies": {
     "concurrently": "^9.0.1"
