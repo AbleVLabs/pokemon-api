@@ -7,6 +7,7 @@
 #   - Autocomplete name suggestions
 #   - Per-user WATCHLIST, stored in the database, protected by Clerk auth
 #   - Per-card CONDITION (Near Mint, Lightly Played, etc.)
+#   - Per-card QUANTITY owned (how many copies the user has)
 #   - PRICE SNAPSHOTS — a dated price record every time cards are fetched,
 #     so we can show price history over time.
 # ---------------------------------------------------------------------------
@@ -57,7 +58,7 @@ ALLOWED_CONDITIONS = {
 
 clerk_client = Clerk(bearer_auth=CLERK_SECRET_KEY)
 
-app = FastAPI(title="Pokemon Card Price API", version="2.2")
+app = FastAPI(title="Pokemon Card Price API", version="2.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -139,7 +140,15 @@ def init_db() -> None:
     except sqlite3.OperationalError:
         pass  # column already exists
 
-    # NEW: price_snapshots — one row per (card, date). Records what a card's
+    # Add the 'quantity' column to watchlist if it isn't there yet.
+    try:
+        conn.execute(
+            "ALTER TABLE watchlist ADD COLUMN quantity INTEGER NOT NULL " "DEFAULT 1"
+        )
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+    # price_snapshots — one row per (card, date). Records what a card's
     # market price was on a given day, so we can build price-history charts.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS price_snapshots (
@@ -426,6 +435,13 @@ class ConditionUpdateIn(BaseModel):
     condition: str
 
 
+class QuantityUpdateIn(BaseModel):
+    """The frontend sends this when the user changes a card's quantity."""
+
+    card_id: str
+    quantity: int
+
+
 # ---------------------------------------------------------------------------
 # ROUTES — search
 # ---------------------------------------------------------------------------
@@ -506,7 +522,8 @@ def price_history(card_id: str):
 
 @app.get("/watchlist")
 def get_watchlist(authorization: str | None = Header(default=None)):
-    """Return the signed-in user's watchlist, each card with its condition."""
+    """Return the signed-in user's watchlist — each card with its
+    condition and quantity owned."""
     user_id = get_user_id(authorization)
 
     conn = sqlite3.connect(DATABASE)
@@ -514,7 +531,7 @@ def get_watchlist(authorization: str | None = Header(default=None)):
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT card_json, condition FROM watchlist "
+            "SELECT card_json, condition, quantity FROM watchlist "
             "WHERE user_id = ? ORDER BY added_at",
             (user_id,),
         )
@@ -526,6 +543,7 @@ def get_watchlist(authorization: str | None = Header(default=None)):
     for row in rows:
         card = json.loads(row["card_json"])
         card["condition"] = row["condition"]
+        card["quantity"] = row["quantity"]
         cards.append(card)
 
     return {"cards": cards, "count": len(cards)}
@@ -581,6 +599,34 @@ def update_condition(
         "status": "updated",
         "card_id": payload.card_id,
         "condition": payload.condition,
+    }
+
+
+@app.post("/watchlist/quantity")
+def update_quantity(
+    payload: QuantityUpdateIn,
+    authorization: str | None = Header(default=None),
+):
+    """Update the quantity of one card in the signed-in user's watchlist."""
+    user_id = get_user_id(authorization)
+
+    # Quantity can't go negative. Clamp anything below 0 up to 0.
+    quantity = max(0, payload.quantity)
+
+    conn = sqlite3.connect(DATABASE)
+    try:
+        conn.execute(
+            "UPDATE watchlist SET quantity = ? " "WHERE user_id = ? AND card_id = ?",
+            (quantity, user_id, payload.card_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "status": "updated",
+        "card_id": payload.card_id,
+        "quantity": quantity,
     }
 
 

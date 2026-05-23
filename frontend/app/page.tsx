@@ -152,6 +152,7 @@ interface WatchCard {
   small_image: string;
   large_image: string;
   condition?: string;
+  quantity?: number;
 }
 
 export default function Home() {
@@ -274,8 +275,37 @@ export default function Home() {
     }
   };
 
+  // Change a watchlist card's quantity — updates the screen, then the backend.
+  // Quantity never goes below 0 (0 just means "own none right now").
+  const changeQuantity = async (cardId: string, quantity: number) => {
+    const safeQuantity = Math.max(0, quantity);
+    setWatchlist((prev) =>
+      prev.map((c) =>
+        c.card_id === cardId ? { ...c, quantity: safeQuantity } : c
+      )
+    );
+    try {
+      const token = await getToken();
+      await fetch(`${API_URL}/watchlist/quantity`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ card_id: cardId, quantity: safeQuantity }),
+      });
+    } catch {
+      alert('Could not save the quantity. Please try again.');
+    }
+  };
+
+  // Total value now multiplies each card's price by how many you own.
   const watchlistTotal = useMemo(
-    () => watchlist.reduce((sum, c) => sum + (c.market_price || 0), 0),
+    () =>
+      watchlist.reduce(
+        (sum, c) => sum + (c.market_price || 0) * (c.quantity ?? 1),
+        0
+      ),
     [watchlist]
   );
 
@@ -283,24 +313,27 @@ export default function Home() {
     if (watchlist.length === 0) return;
 
     const rows = watchlist.map((card) => {
-      const price =
+      const unitPrice =
         card.market_price && card.market_price > 0
           ? Number(card.market_price.toFixed(2))
           : 0;
+      const quantity = card.quantity ?? 1;
       return {
         'Card Name': card.pokemon_name,
         'Set': card.set_name || 'Unknown',
         'Rarity': card.rarity || 'Unknown',
         'Condition': card.condition || 'Near Mint',
-        'Market Price (USD)': price,
-        'Adjusted Price (USD)': price,
+        'Quantity': quantity,
+        'Unit Price (USD)': unitPrice,
+        'Line Total (USD)': Number((unitPrice * quantity).toFixed(2)),
       };
     });
 
     const blank = {
       'Card Name': '', 'Set': '', 'Rarity': '', 'Condition': '',
-      'Market Price (USD)': '' as unknown as number,
-      'Adjusted Price (USD)': '' as unknown as number,
+      'Quantity': '' as unknown as number,
+      'Unit Price (USD)': '' as unknown as number,
+      'Line Total (USD)': '' as unknown as number,
     };
     rows.push(blank);
     rows.push({
@@ -308,14 +341,15 @@ export default function Home() {
       'Set': '',
       'Rarity': '',
       'Condition': '',
-      'Market Price (USD)': '' as unknown as number,
-      'Adjusted Price (USD)': Number(watchlistTotal.toFixed(2)),
+      'Quantity': '' as unknown as number,
+      'Unit Price (USD)': '' as unknown as number,
+      'Line Total (USD)': Number(watchlistTotal.toFixed(2)),
     });
 
     const worksheet = XLSX.utils.json_to_sheet(rows);
     worksheet['!cols'] = [
       { wch: 28 }, { wch: 26 }, { wch: 18 },
-      { wch: 16 }, { wch: 20 }, { wch: 20 },
+      { wch: 16 }, { wch: 10 }, { wch: 16 }, { wch: 16 },
     ];
 
     const workbook = XLSX.utils.book_new();
@@ -780,55 +814,104 @@ export default function Home() {
 
               {/* Watchlist cards */}
               <div className="flex flex-col gap-3">
-                {watchlist.map((card) => (
-                  <div
-                    key={card.card_id}
-                    className="bg-zinc-900 rounded-xl p-3 border border-zinc-800"
-                  >
-                    <div className="flex gap-3">
-                      <img
-                        src={card.small_image}
-                        alt={card.pokemon_name}
-                        className="w-16 rounded-md flex-shrink-0"
-                      />
-                      <div className="flex-1 min-w-0">
-                        <p className="font-semibold truncate">{card.pokemon_name}</p>
-                        <p className="text-zinc-500 text-xs truncate">
-                          {card.set_name || 'Unknown set'}
-                        </p>
-                        <p className="text-yellow-400 font-bold mt-1">
-                          {card.market_price && card.market_price > 0
-                            ? `$${Number(card.market_price).toFixed(2)}`
-                            : 'No price'}
-                        </p>
+                {watchlist.map((card) => {
+                  const quantity = card.quantity ?? 1;
+                  return (
+                    <div
+                      key={card.card_id}
+                      className="bg-zinc-900 rounded-xl p-3 border border-zinc-800"
+                    >
+                      <div className="flex gap-3">
+                        <img
+                          src={card.small_image}
+                          alt={card.pokemon_name}
+                          className="w-16 rounded-md flex-shrink-0"
+                        />
+                        <div className="flex-1 min-w-0">
+                          <p className="font-semibold truncate">{card.pokemon_name}</p>
+                          <p className="text-zinc-500 text-xs truncate">
+                            {card.set_name || 'Unknown set'}
+                          </p>
+                          <p className="text-yellow-400 font-bold mt-1">
+                            {card.market_price && card.market_price > 0
+                              ? `$${Number(card.market_price).toFixed(2)}`
+                              : 'No price'}
+                          </p>
+                          {/* Line total — shown when you own more than one */}
+                          {quantity !== 1 && card.market_price > 0 && (
+                            <p className="text-zinc-500 text-xs">
+                              × {quantity} = $
+                              {(card.market_price * quantity).toFixed(2)}
+                            </p>
+                          )}
+                        </div>
+                        <button
+                          onClick={() => toggleWatch(card)}
+                          className="text-zinc-500 hover:text-red-400 text-sm self-start"
+                        >
+                          Remove
+                        </button>
                       </div>
-                      <button
-                        onClick={() => toggleWatch(card)}
-                        className="text-zinc-500 hover:text-red-400 text-sm self-start"
-                      >
-                        Remove
-                      </button>
-                    </div>
 
-                    {/* Condition selector */}
-                    <div className="mt-3">
-                      <label className="text-zinc-500 text-xs">Card condition</label>
-                      <select
-                        value={card.condition || 'Near Mint'}
-                        onChange={(e) => changeCondition(card.card_id, e.target.value)}
-                        className="w-full mt-1 p-2 rounded-lg bg-zinc-950 border border-zinc-800
-                                   text-zinc-200 text-sm
-                                   focus:outline-none focus:border-yellow-500 transition-colors"
-                      >
-                        {CONDITIONS.map((c) => (
-                          <option key={c.name} value={c.name}>
-                            {c.name}
-                          </option>
-                        ))}
-                      </select>
+                      {/* Condition selector */}
+                      <div className="mt-3">
+                        <label className="text-zinc-500 text-xs">Card condition</label>
+                        <select
+                          value={card.condition || 'Near Mint'}
+                          onChange={(e) => changeCondition(card.card_id, e.target.value)}
+                          className="w-full mt-1 p-2 rounded-lg bg-zinc-950 border border-zinc-800
+                                     text-zinc-200 text-sm
+                                     focus:outline-none focus:border-yellow-500 transition-colors"
+                        >
+                          {CONDITIONS.map((c) => (
+                            <option key={c.name} value={c.name}>
+                              {c.name}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {/* Quantity stepper */}
+                      <div className="mt-3 flex items-center justify-between">
+                        <label className="text-zinc-500 text-xs">Quantity owned</label>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() =>
+                              changeQuantity(card.card_id, quantity - 1)
+                            }
+                            disabled={quantity <= 0}
+                            aria-label="Decrease quantity"
+                            className="w-8 h-8 rounded-lg bg-zinc-950 border border-zinc-800
+                                       text-zinc-200 text-lg leading-none
+                                       flex items-center justify-center
+                                       hover:border-yellow-500 hover:text-yellow-400
+                                       transition-colors
+                                       disabled:opacity-40 disabled:cursor-not-allowed
+                                       disabled:hover:border-zinc-800 disabled:hover:text-zinc-200"
+                          >
+                            −
+                          </button>
+                          <span className="w-8 text-center font-semibold text-zinc-200">
+                            {quantity}
+                          </span>
+                          <button
+                            onClick={() =>
+                              changeQuantity(card.card_id, quantity + 1)
+                            }
+                            aria-label="Increase quantity"
+                            className="w-8 h-8 rounded-lg bg-zinc-950 border border-zinc-800
+                                       text-zinc-200 text-lg leading-none
+                                       flex items-center justify-center
+                                       hover:border-yellow-500 hover:text-yellow-400
+                                       transition-colors"
+                          >
+                            +
+                          </button>
+                        </div>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}
