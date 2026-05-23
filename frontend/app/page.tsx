@@ -555,17 +555,47 @@ export default function Home() {
 
         {/* EMPTY STATE */}
         {!loading && !error && !searchTerm && (
-          <div className="text-center py-20">
+          <div className="text-center py-16">
             <div className="mx-auto mb-6 w-16 h-16 rounded-full border-4 border-yellow-400/30
                             flex items-center justify-center">
               <div className="w-6 h-6 rounded-full bg-yellow-400/40" />
             </div>
-            <h2 className="text-2xl font-semibold mb-2">
-              Find any Pokémon card&apos;s value
+
+            <h2 className="text-2xl md:text-3xl font-semibold mb-2">
+              Track what your Pokémon cards are worth
             </h2>
-            <p className="text-zinc-500 mb-8">
-              Search thousands of cards across every set. Try one of these:
+            <p className="text-zinc-500 mb-10 max-w-xl mx-auto">
+              Search any card to see live prices, rarities, and sets — then build
+              your collection and watch its value over time.
             </p>
+
+            {/* How it works — 3 quick steps */}
+            <div className="flex flex-col sm:flex-row justify-center gap-4 mb-10 max-w-2xl mx-auto">
+              {[
+                { icon: '🔍', title: 'Search', text: 'Find any card by name' },
+                { icon: '📊', title: 'Track prices', text: 'See market value & history' },
+                { icon: '♥', title: 'Build your collection', text: 'Save cards to your watchlist' },
+              ].map((step) => (
+                <div
+                  key={step.title}
+                  className="flex-1 bg-zinc-900 border border-zinc-800 rounded-xl p-4"
+                >
+                  <div className="text-2xl mb-2">{step.icon}</div>
+                  <p className="font-semibold text-zinc-200">{step.title}</p>
+                  <p className="text-zinc-500 text-sm">{step.text}</p>
+                </div>
+              ))}
+            </div>
+
+            {/* Account nudge — only for signed-out visitors */}
+            {!isSignedIn && (
+              <p className="text-zinc-500 text-sm mb-10">
+                <span className="text-yellow-400">Sign in</span> (top-right) to
+                build your collection and access it from any device.
+              </p>
+            )}
+
+            <p className="text-zinc-500 mb-4">Try one of these:</p>
             <div className="flex flex-wrap justify-center gap-3">
               {EXAMPLE_SEARCHES.map((name) => (
                 <button
