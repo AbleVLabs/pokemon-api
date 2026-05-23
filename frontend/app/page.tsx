@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useMemo, useEffect, useCallback } from 'react';
+import Link from 'next/link';
 import { useAuth } from '@clerk/nextjs';
 import * as XLSX from 'xlsx';
 import {
@@ -434,18 +435,30 @@ export default function Home() {
             />
           </div>
 
-          <button
-            onClick={() => setPanelOpen(true)}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg
-                       bg-zinc-900 border border-zinc-800 text-zinc-200
-                       hover:border-yellow-500 hover:text-yellow-400 transition-colors"
-          >
-            <span>♡</span>
-            <span className="font-medium">Watchlist</span>
-            <span className="text-xs px-2 py-0.5 rounded-full bg-yellow-400 text-black font-bold">
-              {watchlist.length}
-            </span>
-          </button>
+          <div className="flex items-center gap-3">
+            <Link
+              href="/dashboard"
+              className="flex items-center gap-2 px-4 py-2 rounded-lg
+                         bg-zinc-900 border border-zinc-800 text-zinc-200
+                         hover:border-yellow-500 hover:text-yellow-400 transition-colors"
+            >
+              <span>📊</span>
+              <span className="font-medium">Dashboard</span>
+            </Link>
+
+            <button
+              onClick={() => setPanelOpen(true)}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg
+                         bg-zinc-900 border border-zinc-800 text-zinc-200
+                         hover:border-yellow-500 hover:text-yellow-400 transition-colors"
+            >
+              <span>♡</span>
+              <span className="font-medium">Watchlist</span>
+              <span className="text-xs px-2 py-0.5 rounded-full bg-yellow-400 text-black font-bold">
+                {watchlist.length}
+              </span>
+            </button>
+          </div>
         </div>
 
         {/* Main title — Orbitron font, the EtherDex brand look */}
