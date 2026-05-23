@@ -6,6 +6,7 @@
 #   - Card search (Pokémon TCG API + local DB cache, with freshness TTL)
 #   - Autocomplete name suggestions
 #   - Per-user WATCHLIST, stored in the database, protected by Clerk auth
+#   - Per-card CONDITION (Near Mint, Lightly Played, etc.)
 # ---------------------------------------------------------------------------
 
 import os
@@ -20,10 +21,8 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Load variables from the .env file (gives us CLERK_SECRET_KEY).
 load_dotenv()
 
-# Clerk SDK — used to verify that a request really comes from a logged-in user.
 from clerk_backend_api import Clerk
 from clerk_backend_api.security.types import AuthenticateRequestOptions
 import httpx
@@ -45,11 +44,19 @@ CLERK_SECRET_KEY = os.environ.get("CLERK_SECRET_KEY", "")
 if not CLERK_SECRET_KEY:
     print("WARNING: CLERK_SECRET_KEY not set — watchlist endpoints will fail.")
 
-# The Clerk client, used to verify login tokens.
+# The valid card conditions. The backend rejects anything not in this set.
+ALLOWED_CONDITIONS = {
+    "Mint",
+    "Near Mint",
+    "Lightly Played",
+    "Moderately Played",
+    "Heavily Played",
+    "Damaged",
+}
+
 clerk_client = Clerk(bearer_auth=CLERK_SECRET_KEY)
 
-
-app = FastAPI(title="Pokemon Card Price API", version="2.0")
+app = FastAPI(title="Pokemon Card Price API", version="2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -94,7 +101,7 @@ def init_db() -> None:
     """Create the cards table and the watchlist table if they don't exist."""
     conn = sqlite3.connect(DATABASE)
 
-    # Cards cache table (unchanged).
+    # Cards cache table.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS cards (
             card_id       TEXT PRIMARY KEY,
@@ -110,9 +117,7 @@ def init_db() -> None:
         """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pokemon_name ON cards(pokemon_name)")
 
-    # NEW: watchlist table — one row per (user, card).
-    # user_id is the Clerk user ID. card_json stores the full card so we
-    # can show it without re-fetching.
+    # Watchlist table — one row per (user, card).
     conn.execute("""
         CREATE TABLE IF NOT EXISTS watchlist (
             user_id    TEXT NOT NULL,
@@ -123,6 +128,18 @@ def init_db() -> None:
         )
         """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_user ON watchlist(user_id)")
+
+    # Add the 'condition' column if it isn't there yet. This is a safe
+    # migration — existing watchlist rows are kept, they just get the
+    # default 'Near Mint'. If the column already exists, SQLite raises an
+    # error, which we simply ignore.
+    try:
+        conn.execute(
+            "ALTER TABLE watchlist ADD COLUMN condition TEXT NOT NULL "
+            "DEFAULT 'Near Mint'"
+        )
+    except sqlite3.OperationalError:
+        pass  # column already exists — nothing to do
 
     conn.commit()
     conn.close()
@@ -140,16 +157,12 @@ def get_user_id(authorization: str | None) -> str:
     """
     Verify the Clerk token from the Authorization header and return the
     user's Clerk ID. Raises 401 if the token is missing or invalid.
-
-    The frontend sends:  Authorization: Bearer <clerk-token>
     """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not signed in.")
 
     token = authorization.split(" ", 1)[1]
 
-    # Clerk verifies the token. We wrap it in a minimal httpx.Request
-    # because that's what the SDK expects.
     try:
         fake_request = httpx.Request(
             method="GET",
@@ -167,7 +180,6 @@ def get_user_id(authorization: str | None) -> str:
     if not state.is_signed_in:
         raise HTTPException(status_code=401, detail="Invalid session.")
 
-    # The user's Clerk ID lives in the token's "sub" claim.
     user_id = (state.payload or {}).get("sub")
     if not user_id:
         raise HTTPException(status_code=401, detail="Could not identify user.")
@@ -176,7 +188,7 @@ def get_user_id(authorization: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# CARD SEARCH HELPERS  (unchanged from before)
+# CARD SEARCH HELPERS
 # ---------------------------------------------------------------------------
 
 
@@ -368,8 +380,15 @@ class WatchCardIn(BaseModel):
     large_image: str | None = ""
 
 
+class ConditionUpdateIn(BaseModel):
+    """The frontend sends this when the user changes a card's condition."""
+
+    card_id: str
+    condition: str
+
+
 # ---------------------------------------------------------------------------
-# ROUTES — search (unchanged)
+# ROUTES — search
 # ---------------------------------------------------------------------------
 
 
@@ -420,13 +439,13 @@ def search_cards(
 
 
 # ---------------------------------------------------------------------------
-# ROUTES — watchlist (NEW, require a signed-in user)
+# ROUTES — watchlist (require a signed-in user)
 # ---------------------------------------------------------------------------
 
 
 @app.get("/watchlist")
 def get_watchlist(authorization: str | None = Header(default=None)):
-    """Return the signed-in user's watchlist."""
+    """Return the signed-in user's watchlist, each card with its condition."""
     user_id = get_user_id(authorization)
 
     conn = sqlite3.connect(DATABASE)
@@ -434,14 +453,20 @@ def get_watchlist(authorization: str | None = Header(default=None)):
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT card_json FROM watchlist WHERE user_id = ? ORDER BY added_at",
+            "SELECT card_json, condition FROM watchlist "
+            "WHERE user_id = ? ORDER BY added_at",
             (user_id,),
         )
         rows = cursor.fetchall()
     finally:
         conn.close()
 
-    cards = [json.loads(row["card_json"]) for row in rows]
+    cards = []
+    for row in rows:
+        card = json.loads(row["card_json"])
+        card["condition"] = row["condition"]
+        cards.append(card)
+
     return {"cards": cards, "count": len(cards)}
 
 
@@ -468,6 +493,34 @@ def add_to_watchlist(
         conn.close()
 
     return {"status": "added", "card_id": card.card_id}
+
+
+@app.post("/watchlist/condition")
+def update_condition(
+    payload: ConditionUpdateIn,
+    authorization: str | None = Header(default=None),
+):
+    """Update the condition of one card in the signed-in user's watchlist."""
+    user_id = get_user_id(authorization)
+
+    if payload.condition not in ALLOWED_CONDITIONS:
+        raise HTTPException(status_code=400, detail="Invalid condition.")
+
+    conn = sqlite3.connect(DATABASE)
+    try:
+        conn.execute(
+            "UPDATE watchlist SET condition = ? " "WHERE user_id = ? AND card_id = ?",
+            (payload.condition, user_id, payload.card_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "status": "updated",
+        "card_id": payload.card_id,
+        "condition": payload.condition,
+    }
 
 
 @app.delete("/watchlist/remove/{card_id}")
