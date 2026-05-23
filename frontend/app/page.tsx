@@ -3,6 +3,14 @@
 import { useState, useMemo, useEffect, useCallback } from 'react';
 import { useAuth } from '@clerk/nextjs';
 import * as XLSX from 'xlsx';
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip,
+  ResponsiveContainer,
+} from 'recharts';
 import useCards from '../hooks/useCards';
 
 const CARDS_PER_PAGE = 24;
@@ -36,6 +44,104 @@ const CONDITIONS = [
     desc: 'Major defects affecting the card, such as bends, tears, water damage, writing, holes, peeling, or severe creasing.',
   },
 ];
+
+interface PricePoint {
+  date: string;
+  price: number;
+}
+
+// Small price-history chart shown inside the card detail modal.
+// Handles three cases: no data, one data point, and a full trend line.
+function PriceHistoryChart({ cardId }: { cardId: string }) {
+  const [history, setHistory] = useState<PricePoint[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+
+    const load = async () => {
+      try {
+        const res = await fetch(`${API_URL}/price-history/${cardId}`);
+        const data = await res.json();
+        if (!cancelled) setHistory(data.history || []);
+      } catch {
+        if (!cancelled) setHistory([]);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [cardId]);
+
+  if (loading) {
+    return <p className="text-zinc-600 text-sm">Loading price history...</p>;
+  }
+
+  // No data yet — recording is new, so this is normal.
+  if (history.length === 0) {
+    return (
+      <p className="text-zinc-600 text-sm">
+        Price history will appear here as data is collected over time.
+      </p>
+    );
+  }
+
+  // Only one snapshot — a line needs at least two points, so show the value.
+  if (history.length === 1) {
+    return (
+      <p className="text-zinc-400 text-sm">
+        First price recorded:{' '}
+        <span className="text-yellow-400 font-semibold">
+          ${history[0].price.toFixed(2)}
+        </span>{' '}
+        on {history[0].date}. The chart appears once more data is collected.
+      </p>
+    );
+  }
+
+  // Two or more snapshots — draw the trend line.
+  return (
+    <div className="w-full h-48">
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={history} margin={{ top: 5, right: 10, bottom: 5, left: -10 }}>
+          <XAxis
+            dataKey="date"
+            tick={{ fill: '#71717a', fontSize: 11 }}
+            tickLine={false}
+            axisLine={{ stroke: '#3f3f46' }}
+          />
+          <YAxis
+            tick={{ fill: '#71717a', fontSize: 11 }}
+            tickLine={false}
+            axisLine={{ stroke: '#3f3f46' }}
+            tickFormatter={(v) => `$${v}`}
+          />
+          <Tooltip
+            contentStyle={{
+              background: '#18181b',
+              border: '1px solid #3f3f46',
+              borderRadius: '8px',
+              color: '#fff',
+            }}
+            formatter={(v) => [`$${Number(v).toFixed(2)}`, 'Price']}
+          />
+          <Line
+            type="monotone"
+            dataKey="price"
+            stroke="#facc15"
+            strokeWidth={2}
+            dot={{ fill: '#facc15', r: 3 }}
+          />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
 
 interface WatchCard {
   card_id: string;
@@ -775,6 +881,14 @@ export default function Home() {
                       : 'No price'}
                   </span>
                 </div>
+              </div>
+
+              {/* Price history chart */}
+              <div className="mb-6">
+                <h3 className="text-zinc-300 text-sm font-semibold mb-2">
+                  Price History
+                </h3>
+                <PriceHistoryChart cardId={selectedCard.card_id} />
               </div>
 
               <button

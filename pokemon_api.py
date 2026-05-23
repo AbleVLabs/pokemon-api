@@ -7,6 +7,8 @@
 #   - Autocomplete name suggestions
 #   - Per-user WATCHLIST, stored in the database, protected by Clerk auth
 #   - Per-card CONDITION (Near Mint, Lightly Played, etc.)
+#   - PRICE SNAPSHOTS — a dated price record every time cards are fetched,
+#     so we can show price history over time.
 # ---------------------------------------------------------------------------
 
 import os
@@ -44,7 +46,6 @@ CLERK_SECRET_KEY = os.environ.get("CLERK_SECRET_KEY", "")
 if not CLERK_SECRET_KEY:
     print("WARNING: CLERK_SECRET_KEY not set — watchlist endpoints will fail.")
 
-# The valid card conditions. The backend rejects anything not in this set.
 ALLOWED_CONDITIONS = {
     "Mint",
     "Near Mint",
@@ -56,7 +57,7 @@ ALLOWED_CONDITIONS = {
 
 clerk_client = Clerk(bearer_auth=CLERK_SECRET_KEY)
 
-app = FastAPI(title="Pokemon Card Price API", version="2.1")
+app = FastAPI(title="Pokemon Card Price API", version="2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -98,7 +99,7 @@ POKEMON_NAMES = load_pokemon_names()
 
 
 def init_db() -> None:
-    """Create the cards table and the watchlist table if they don't exist."""
+    """Create the cards, watchlist, and price_snapshots tables if missing."""
     conn = sqlite3.connect(DATABASE)
 
     # Cards cache table.
@@ -129,17 +130,28 @@ def init_db() -> None:
         """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_user ON watchlist(user_id)")
 
-    # Add the 'condition' column if it isn't there yet. This is a safe
-    # migration — existing watchlist rows are kept, they just get the
-    # default 'Near Mint'. If the column already exists, SQLite raises an
-    # error, which we simply ignore.
+    # Add the 'condition' column to watchlist if it isn't there yet.
     try:
         conn.execute(
             "ALTER TABLE watchlist ADD COLUMN condition TEXT NOT NULL "
             "DEFAULT 'Near Mint'"
         )
     except sqlite3.OperationalError:
-        pass  # column already exists — nothing to do
+        pass  # column already exists
+
+    # NEW: price_snapshots — one row per (card, date). Records what a card's
+    # market price was on a given day, so we can build price-history charts.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS price_snapshots (
+            card_id        TEXT NOT NULL,
+            snapshot_date  TEXT NOT NULL,
+            market_price   REAL NOT NULL,
+            PRIMARY KEY (card_id, snapshot_date)
+        )
+        """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_snapshot_card " "ON price_snapshots(card_id)"
+    )
 
     conn.commit()
     conn.close()
@@ -196,6 +208,11 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _today_str() -> str:
+    """Today's date as YYYY-MM-DD (UTC) — used as the snapshot date."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
 def _api_headers() -> dict:
     return {"X-Api-Key": API_KEY} if API_KEY else {}
 
@@ -227,6 +244,26 @@ def _row_from_api_card(card: dict) -> dict | None:
         "small_image": images.get("small"),
         "large_image": images.get("large"),
     }
+
+
+def record_snapshot(conn: sqlite3.Connection, card_id: str, price: float) -> None:
+    """
+    Save today's price for a card into price_snapshots.
+
+    INSERT OR IGNORE means: if a snapshot for this card already exists for
+    today, we keep the first one and skip — at most one snapshot per card
+    per day. Cards with no real price (0) are skipped.
+    """
+    if not price or price <= 0:
+        return
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO price_snapshots
+        (card_id, snapshot_date, market_price)
+        VALUES (?, ?, ?)
+        """,
+        (card_id, _today_str(), price),
+    )
 
 
 def is_data_fresh(name: str) -> bool:
@@ -309,6 +346,8 @@ def fetch_from_api(name: str) -> int:
                         timestamp,
                     ),
                 )
+                # Record today's price snapshot for this card.
+                record_snapshot(conn, row["card_id"], row["market_price"])
                 total += 1
 
             if len(page_cards) < PAGE_SIZE:
@@ -436,6 +475,28 @@ def search_cards(
 
     results = query_local_db(name, rarity, sort, min_price, max_price)
     return {"cards": results, "count": len(results)}
+
+
+@app.get("/price-history/{card_id}")
+def price_history(card_id: str):
+    """Return the recorded price snapshots for one card, oldest first."""
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT snapshot_date, market_price FROM price_snapshots "
+            "WHERE card_id = ? ORDER BY snapshot_date ASC",
+            (card_id,),
+        )
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    history = [
+        {"date": row["snapshot_date"], "price": row["market_price"]} for row in rows
+    ]
+    return {"card_id": card_id, "history": history, "count": len(history)}
 
 
 # ---------------------------------------------------------------------------
