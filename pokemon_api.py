@@ -10,6 +10,7 @@
 #   - Per-card QUANTITY owned (how many copies the user has)
 #   - PRICE SNAPSHOTS — a dated price record every time cards are fetched,
 #     so we can show price history over time.
+#   - SET DATA — each set's card count, for set-completion tracking.
 # ---------------------------------------------------------------------------
 
 import os
@@ -36,10 +37,12 @@ import httpx
 
 DATABASE = "pokemon_cards.db"
 POKEMON_TCG_API = "https://api.pokemontcg.io/v2/cards"
+SETS_API = "https://api.pokemontcg.io/v2/sets"
 PAGE_SIZE = 250
 MAX_PAGES = 20
 REQUEST_TIMEOUT = 20
 FRESHNESS_DAYS = 7
+SETS_FRESHNESS_DAYS = 7
 
 API_KEY = os.environ.get("POKEMON_TCG_API_KEY", "")
 CLERK_SECRET_KEY = os.environ.get("CLERK_SECRET_KEY", "")
@@ -58,7 +61,7 @@ ALLOWED_CONDITIONS = {
 
 clerk_client = Clerk(bearer_auth=CLERK_SECRET_KEY)
 
-app = FastAPI(title="Pokemon Card Price API", version="2.3")
+app = FastAPI(title="Pokemon Card Price API", version="2.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -100,7 +103,7 @@ POKEMON_NAMES = load_pokemon_names()
 
 
 def init_db() -> None:
-    """Create the cards, watchlist, and price_snapshots tables if missing."""
+    """Create the cards, watchlist, price_snapshots, and sets tables."""
     conn = sqlite3.connect(DATABASE)
 
     # Cards cache table.
@@ -161,6 +164,20 @@ def init_db() -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_snapshot_card " "ON price_snapshots(card_id)"
     )
+
+    # sets — one row per Pokémon set, with its total card count.
+    # Powers set-completion tracking on the dashboard.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sets (
+            set_id         TEXT PRIMARY KEY,
+            set_name       TEXT,
+            total          INTEGER,
+            printed_total  INTEGER,
+            release_date   TEXT,
+            last_synced    TEXT
+        )
+        """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_set_name ON sets(set_name)")
 
     conn.commit()
     conn.close()
@@ -382,7 +399,8 @@ def query_local_db(
     try:
         query = """
             SELECT card_id, pokemon_name, set_name, card_number,
-                   rarity, market_price, small_image, large_image
+                   rarity, market_price, small_image, large_image,
+                   last_updated
             FROM cards
             WHERE pokemon_name LIKE ?
             AND market_price >= ?
@@ -409,6 +427,95 @@ def query_local_db(
         return [dict(row) for row in rows]
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# SET DATA — card counts per set, for set-completion tracking
+# ---------------------------------------------------------------------------
+
+
+def sets_need_sync() -> bool:
+    """True if the sets table is empty or hasn't been synced recently."""
+    conn = sqlite3.connect(DATABASE)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT MAX(last_synced) FROM sets")
+        newest = cursor.fetchone()[0]
+    finally:
+        conn.close()
+
+    if not newest:
+        return True
+    try:
+        newest_dt = datetime.fromisoformat(newest)
+    except ValueError:
+        return True
+    cutoff = datetime.now(timezone.utc) - timedelta(days=SETS_FRESHNESS_DAYS)
+    return newest_dt < cutoff
+
+
+def sync_sets() -> None:
+    """
+    Fetch every Pokémon set's card count from the API and store it.
+    Skips if set data was already synced recently. Network failure here
+    is non-fatal — it just retries on the next startup.
+    """
+    if not sets_need_sync():
+        print("Set data is fresh — skipping set sync.")
+        return
+
+    print("Syncing Pokémon set data from the API...")
+    try:
+        # ~165 sets exist; one page of 250 covers them all comfortably.
+        response = requests.get(
+            SETS_API,
+            params={"pageSize": 250},
+            headers=_api_headers(),
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as e:
+        print(f"Set sync failed (will retry next start): {e}")
+        return
+    except ValueError as e:
+        print(f"Set sync returned invalid JSON: {e}")
+        return
+
+    timestamp = _now_iso()
+    conn = sqlite3.connect(DATABASE)
+    try:
+        count = 0
+        for s in data.get("data", []):
+            set_id = s.get("id")
+            if not set_id:
+                continue
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO sets
+                (set_id, set_name, total, printed_total,
+                 release_date, last_synced)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    set_id,
+                    s.get("name"),
+                    s.get("total"),
+                    s.get("printedTotal"),
+                    s.get("releaseDate"),
+                    timestamp,
+                ),
+            )
+            count += 1
+        conn.commit()
+    finally:
+        conn.close()
+
+    print(f"Synced {count} Pokémon sets.")
+
+
+# Sync set data once at startup (skips automatically if already fresh).
+sync_sets()
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +735,185 @@ def update_quantity(
         "card_id": payload.card_id,
         "quantity": quantity,
     }
+
+
+@app.get("/collection/history")
+def collection_history(authorization: str | None = Header(default=None)):
+    """
+    Builds the data for the dashboard's value-over-time chart and the
+    gainers/losers list, from the user's watchlist + recorded price
+    snapshots.
+
+    Both depend on price_snapshots, which only started recording
+    recently — so this is sparse at first and fills in over time.
+    """
+    user_id = get_user_id(authorization)
+
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.cursor()
+
+        # The user's watchlist: card_id, quantity, and stored card info.
+        cursor.execute(
+            "SELECT card_id, card_json, quantity FROM watchlist " "WHERE user_id = ?",
+            (user_id,),
+        )
+        watch_rows = cursor.fetchall()
+
+        quantities: dict[str, int] = {}
+        card_info: dict[str, dict] = {}
+        for row in watch_rows:
+            quantities[row["card_id"]] = row["quantity"]
+            card_info[row["card_id"]] = json.loads(row["card_json"])
+
+        card_ids = list(quantities.keys())
+        if not card_ids:
+            return {"value_history": [], "movers": []}
+
+        # Every price snapshot for those cards, oldest first.
+        placeholders = ",".join("?" for _ in card_ids)
+        cursor.execute(
+            f"""
+            SELECT snapshot_date, card_id, market_price
+            FROM price_snapshots
+            WHERE card_id IN ({placeholders})
+            ORDER BY snapshot_date ASC
+            """,
+            card_ids,
+        )
+        snap_rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    # Group snapshots by card. Each list is oldest-first (the query
+    # was ORDER BY snapshot_date ASC).
+    per_card: dict[str, list[tuple[str, float]]] = {}
+    for row in snap_rows:
+        per_card.setdefault(row["card_id"], []).append(
+            (row["snapshot_date"], row["market_price"])
+        )
+
+    # --- VALUE OVER TIME ---
+    # For each date, each card contributes its most recent price ON OR
+    # BEFORE that date (carried forward). Without this, a day where only
+    # some cards were snapshotted would look like the collection crashed.
+    all_dates = sorted({row["snapshot_date"] for row in snap_rows})
+    value_history = []
+    for date in all_dates:
+        total = 0.0
+        for card_id in card_ids:
+            last_price = None
+            for snap_date, snap_price in per_card.get(card_id, []):
+                if snap_date <= date:
+                    last_price = snap_price
+                else:
+                    break
+            if last_price is not None:
+                total += last_price * quantities.get(card_id, 1)
+        value_history.append({"date": date, "value": round(total, 2)})
+
+    # --- MOVERS (gainers / losers) ---
+    # A card needs at least two snapshots to have "moved" at all.
+    movers = []
+    for card_id, snaps in per_card.items():
+        if len(snaps) < 2:
+            continue
+        old_price = snaps[0][1]
+        new_price = snaps[-1][1]
+        if old_price <= 0:
+            continue
+        change = new_price - old_price
+        change_pct = (change / old_price) * 100
+        info = card_info.get(card_id, {})
+        movers.append(
+            {
+                "card_id": card_id,
+                "pokemon_name": info.get("pokemon_name"),
+                "small_image": info.get("small_image"),
+                "old_price": round(old_price, 2),
+                "new_price": round(new_price, 2),
+                "change": round(change, 2),
+                "change_pct": round(change_pct, 1),
+            }
+        )
+
+    # Biggest gainers first, biggest losers last.
+    movers.sort(key=lambda m: m["change_pct"], reverse=True)
+
+    return {"value_history": value_history, "movers": movers}
+
+
+@app.get("/collection/sets")
+def collection_sets(authorization: str | None = Header(default=None)):
+    """
+    Set-completion data: for each set the user owns cards from, how many
+    distinct cards they have vs. how many the set contains.
+    """
+    user_id = get_user_id(authorization)
+
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.cursor()
+
+        # The user's watchlist cards (each row = one distinct card).
+        cursor.execute(
+            "SELECT card_json FROM watchlist WHERE user_id = ?",
+            (user_id,),
+        )
+        watch_rows = cursor.fetchall()
+
+        # Count how many distinct cards the user owns per set name.
+        owned_by_set: dict[str, int] = {}
+        for row in watch_rows:
+            info = json.loads(row["card_json"])
+            set_name = info.get("set_name")
+            if set_name:
+                owned_by_set[set_name] = owned_by_set.get(set_name, 0) + 1
+
+        if not owned_by_set:
+            return {"sets": []}
+
+        # Look up the total card count for each of those sets.
+        set_names = list(owned_by_set.keys())
+        placeholders = ",".join("?" for _ in set_names)
+        cursor.execute(
+            f"""
+            SELECT set_name, printed_total, total
+            FROM sets
+            WHERE set_name IN ({placeholders})
+            """,
+            set_names,
+        )
+        set_rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    # printed_total is the official set size (e.g. "102"); fall back to
+    # total (which includes secret rares) if it's missing.
+    totals = {
+        row["set_name"]: (row["printed_total"] or row["total"] or 0) for row in set_rows
+    }
+
+    results = []
+    for set_name, owned in owned_by_set.items():
+        total = totals.get(set_name, 0)
+        # Cap owned at the set size so the display never shows over 100%.
+        owned_display = min(owned, total) if total else owned
+        percent = round((owned_display / total) * 100) if total else 0
+        results.append(
+            {
+                "set_name": set_name,
+                "owned": owned_display,
+                "total": total,
+                "percent": percent,
+            }
+        )
+
+    # Most-complete sets first.
+    results.sort(key=lambda s: s["percent"], reverse=True)
+    return {"sets": results}
 
 
 @app.delete("/watchlist/remove/{card_id}")

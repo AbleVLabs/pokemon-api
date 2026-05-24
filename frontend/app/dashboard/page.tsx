@@ -3,6 +3,14 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '@clerk/nextjs';
 import Link from 'next/link';
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip,
+  ResponsiveContainer,
+} from 'recharts';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
 
@@ -18,18 +26,37 @@ interface WatchCard {
   quantity?: number;
 }
 
+interface ValuePoint {
+  date: string;
+  value: number;
+}
+
+interface Mover {
+  card_id: string;
+  pokemon_name: string;
+  small_image: string;
+  old_price: number;
+  new_price: number;
+  change: number;
+  change_pct: number;
+}
+
 export default function Dashboard() {
   const { getToken, isSignedIn, isLoaded } = useAuth();
 
   const [watchlist, setWatchlist] = useState<WatchCard[]>([]);
+  const [valueHistory, setValueHistory] = useState<ValuePoint[]>([]);
+  const [movers, setMovers] = useState<Mover[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // Load the user's watchlist — the whole dashboard is built from it.
+  // Load the watchlist AND the value/movers history together.
   useEffect(() => {
     if (!isLoaded) return;
 
     if (!isSignedIn) {
       setWatchlist([]);
+      setValueHistory([]);
+      setMovers([]);
       setLoading(false);
       return;
     }
@@ -38,12 +65,25 @@ export default function Dashboard() {
       setLoading(true);
       try {
         const token = await getToken();
-        const res = await fetch(`${API_URL}/watchlist`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        if (res.ok) {
-          const data = await res.json();
+
+        // Fetch both at the same time.
+        const [watchRes, histRes] = await Promise.all([
+          fetch(`${API_URL}/watchlist`, {
+            headers: { Authorization: `Bearer ${token}` },
+          }),
+          fetch(`${API_URL}/collection/history`, {
+            headers: { Authorization: `Bearer ${token}` },
+          }),
+        ]);
+
+        if (watchRes.ok) {
+          const data = await watchRes.json();
           setWatchlist(data.cards || []);
+        }
+        if (histRes.ok) {
+          const hist = await histRes.json();
+          setValueHistory(hist.value_history || []);
+          setMovers(hist.movers || []);
         }
       } catch {
         // network hiccup — leave as-is
@@ -69,7 +109,6 @@ export default function Dashboard() {
       0
     );
 
-    // Most valuable single card (by its market price).
     let mostValuable: WatchCard | null = null;
     for (const c of watchlist) {
       if (
@@ -80,12 +119,10 @@ export default function Dashboard() {
       }
     }
 
-    // Top 6 cards by value, highest first.
     const topCards = [...watchlist]
       .sort((a, b) => (b.market_price || 0) - (a.market_price || 0))
       .slice(0, 6);
 
-    // How many cards are in each condition.
     const conditionCounts: Record<string, number> = {};
     for (const c of watchlist) {
       const cond = c.condition || 'Near Mint';
@@ -206,6 +243,112 @@ export default function Dashboard() {
                   )}
               </div>
             </div>
+
+            {/* Value over time */}
+            <h2 className="text-xl font-semibold mb-4">
+              Collection Value Over Time
+            </h2>
+            {valueHistory.length < 2 ? (
+              <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 mb-12">
+                <p className="text-zinc-500 text-sm">
+                  Your value-over-time chart will appear here as price data
+                  is collected. It builds up over the coming days as cards
+                  are searched.
+                </p>
+              </div>
+            ) : (
+              <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 mb-12">
+                <div className="w-full h-64">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart
+                      data={valueHistory}
+                      margin={{ top: 5, right: 10, bottom: 5, left: 0 }}
+                    >
+                      <XAxis
+                        dataKey="date"
+                        tick={{ fill: '#71717a', fontSize: 11 }}
+                        tickLine={false}
+                        axisLine={{ stroke: '#3f3f46' }}
+                      />
+                      <YAxis
+                        tick={{ fill: '#71717a', fontSize: 11 }}
+                        tickLine={false}
+                        axisLine={{ stroke: '#3f3f46' }}
+                        tickFormatter={(v) => `$${v}`}
+                      />
+                      <Tooltip
+                        contentStyle={{
+                          background: '#18181b',
+                          border: '1px solid #3f3f46',
+                          borderRadius: '8px',
+                          color: '#fff',
+                        }}
+                        formatter={(v) => [`$${Number(v).toFixed(2)}`, 'Value']}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="value"
+                        stroke="#facc15"
+                        strokeWidth={2}
+                        dot={{ fill: '#facc15', r: 3 }}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            )}
+
+            {/* Gainers & losers */}
+            <h2 className="text-xl font-semibold mb-4">Gainers &amp; Losers</h2>
+            {movers.length === 0 ? (
+              <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 mb-12">
+                <p className="text-zinc-500 text-sm">
+                  Once a card has at least two recorded prices, its gain or
+                  loss shows here. This fills in as price data is collected.
+                </p>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-3 mb-12">
+                {movers.map((m) => {
+                  const up = m.change >= 0;
+                  return (
+                    <div
+                      key={m.card_id}
+                      className="flex items-center gap-4 bg-zinc-900
+                                 border border-zinc-800 rounded-xl p-3"
+                    >
+                      <img
+                        src={m.small_image}
+                        alt={m.pokemon_name}
+                        className="w-12 rounded-md flex-shrink-0"
+                      />
+                      <div className="flex-1 min-w-0">
+                        <p className="font-semibold truncate">
+                          {m.pokemon_name}
+                        </p>
+                        <p className="text-zinc-500 text-xs">
+                          ${m.old_price.toFixed(2)} → ${m.new_price.toFixed(2)}
+                        </p>
+                      </div>
+                      <div
+                        className={
+                          'text-right flex-shrink-0 ' +
+                          (up ? 'text-green-400' : 'text-red-400')
+                        }
+                      >
+                        <p className="font-bold">
+                          {up ? '+' : ''}
+                          {m.change_pct.toFixed(1)}%
+                        </p>
+                        <p className="text-xs">
+                          {up ? '+' : ''}${m.change.toFixed(2)}
+                        </p>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
 
             {/* Most valuable cards list */}
             <h2 className="text-xl font-semibold mb-4">Most Valuable Cards</h2>
