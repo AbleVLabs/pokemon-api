@@ -41,15 +41,23 @@ interface Mover {
   change_pct: number;
 }
 
+interface SetCompletion {
+  set_name: string;
+  owned: number;
+  total: number;
+  percent: number;
+}
+
 export default function Dashboard() {
   const { getToken, isSignedIn, isLoaded } = useAuth();
 
   const [watchlist, setWatchlist] = useState<WatchCard[]>([]);
   const [valueHistory, setValueHistory] = useState<ValuePoint[]>([]);
   const [movers, setMovers] = useState<Mover[]>([]);
+  const [setCompletion, setSetCompletion] = useState<SetCompletion[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // Load the watchlist AND the value/movers history together.
+  // Load the watchlist, value/movers history, and set completion together.
   useEffect(() => {
     if (!isLoaded) return;
 
@@ -57,6 +65,7 @@ export default function Dashboard() {
       setWatchlist([]);
       setValueHistory([]);
       setMovers([]);
+      setSetCompletion([]);
       setLoading(false);
       return;
     }
@@ -66,12 +75,15 @@ export default function Dashboard() {
       try {
         const token = await getToken();
 
-        // Fetch both at the same time.
-        const [watchRes, histRes] = await Promise.all([
+        // Fetch everything at the same time.
+        const [watchRes, histRes, setsRes] = await Promise.all([
           fetch(`${API_URL}/watchlist`, {
             headers: { Authorization: `Bearer ${token}` },
           }),
           fetch(`${API_URL}/collection/history`, {
+            headers: { Authorization: `Bearer ${token}` },
+          }),
+          fetch(`${API_URL}/collection/sets`, {
             headers: { Authorization: `Bearer ${token}` },
           }),
         ]);
@@ -84,6 +96,10 @@ export default function Dashboard() {
           const hist = await histRes.json();
           setValueHistory(hist.value_history || []);
           setMovers(hist.movers || []);
+        }
+        if (setsRes.ok) {
+          const setsData = await setsRes.json();
+          setSetCompletion(setsData.sets || []);
         }
       } catch {
         // network hiccup — leave as-is
@@ -390,7 +406,7 @@ export default function Dashboard() {
             </h2>
             <div
               className="bg-zinc-900 border border-zinc-800 rounded-xl p-5
-                         flex flex-col gap-2"
+                         flex flex-col gap-2 mb-12"
             >
               {Object.entries(stats.conditionCounts).map(([cond, count]) => (
                 <div key={cond} className="flex justify-between">
@@ -401,6 +417,41 @@ export default function Dashboard() {
                 </div>
               ))}
             </div>
+
+            {/* Set completion */}
+            <h2 className="text-xl font-semibold mb-4">Set Completion</h2>
+            {setCompletion.length === 0 ? (
+              <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+                <p className="text-zinc-500 text-sm">
+                  Set completion appears here once you&apos;ve added cards
+                  from sets we have data for.
+                </p>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-4">
+                {setCompletion.map((s) => (
+                  <div
+                    key={s.set_name}
+                    className="bg-zinc-900 border border-zinc-800 rounded-xl p-4"
+                  >
+                    <div className="flex justify-between items-baseline mb-2">
+                      <span className="font-semibold truncate">
+                        {s.set_name}
+                      </span>
+                      <span className="text-zinc-400 text-sm flex-shrink-0 ml-3">
+                        {s.owned} of {s.total || '?'} · {s.percent}%
+                      </span>
+                    </div>
+                    <div className="w-full h-2.5 rounded-full bg-zinc-800 overflow-hidden">
+                      <div
+                        className="h-full rounded-full bg-yellow-400 transition-all"
+                        style={{ width: `${s.percent}%` }}
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
       </div>
