@@ -1,6 +1,6 @@
 # pokemon_api.py
 # ---------------------------------------------------------------------------
-# EtherDex — backend. (v3.0 — the multi-TCG foundation)
+# EtherDex — backend. (v3.1 — Pokémon + Magic: The Gathering)
 #
 # ARCHITECTURE NOTE (the Phase 1 refactor):
 # EtherDex now supports multiple card games through GAME ADAPTERS. Each
@@ -14,7 +14,7 @@
 # in SQLite keeps serving even when a source is down.
 #
 # Includes:
-#   - GAME ADAPTERS (Pokémon today; MTG, Yu-Gi-Oh, One Piece to come)
+#   - GAME ADAPTERS (Pokémon + MTG live; Yu-Gi-Oh, One Piece to come)
 #   - Card search (per-game API + local DB cache, with freshness TTL)
 #   - Autocomplete name suggestions (Pokémon names; per-game later)
 #   - Per-user WATCHLIST, stored in the database, protected by Clerk auth
@@ -28,6 +28,7 @@
 import os
 import csv
 import json
+import time
 import sqlite3
 import requests
 from datetime import datetime, timedelta, timezone
@@ -71,7 +72,7 @@ ALLOWED_CONDITIONS = {
 
 clerk_client = Clerk(bearer_auth=CLERK_SECRET_KEY)
 
-app = FastAPI(title="EtherDex API", version="3.0")
+app = FastAPI(title="EtherDex API", version="3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -132,6 +133,11 @@ class GameAdapter:
         MAY raise requests.RequestException — the sync layer catches it
         per-adapter, so one game's failure never affects the others."""
         raise NotImplementedError
+
+    def autocomplete(self, q: str) -> list[str]:
+        """Name suggestions for the search box. Optional — games
+        without a suggestion source just return no suggestions."""
+        return []
 
 
 class PokemonAdapter(GameAdapter):
@@ -242,11 +248,189 @@ class PokemonAdapter(GameAdapter):
             )
         return rows
 
+    def autocomplete(self, q: str) -> list[str]:
+        query = q.strip().lower()
+        if not query:
+            return []
+        return [n for n in POKEMON_NAMES if n.lower().startswith(query)][:8]
+
+
+class MTGAdapter(GameAdapter):
+    """Magic: The Gathering, via the Scryfall API (free, no key).
+
+    Scryfall is the gold-standard MTG API. Their etiquette rules, which
+    we follow: identify yourself with a User-Agent, and keep 50-100ms
+    between requests.
+    """
+
+    game = "mtg"
+    display_name = "Magic: The Gathering"
+
+    CARDS_API = "https://api.scryfall.com/cards/search"
+    SETS_API = "https://api.scryfall.com/sets"
+    AUTOCOMPLETE_API = "https://api.scryfall.com/cards/autocomplete"
+
+    HEADERS = {
+        "User-Agent": "EtherDex/3.1 (TCG collection tracker)",
+        "Accept": "application/json",
+    }
+
+    @staticmethod
+    def _extract_price(card: dict) -> float:
+        """Scryfall prices are strings (or null): usd, usd_foil, etc.
+        Prefer the regular price, fall back to foil/etched."""
+        prices = card.get("prices") or {}
+        for key in ("usd", "usd_foil", "usd_etched"):
+            value = prices.get(key)
+            if value:
+                try:
+                    price = float(value)
+                except ValueError:
+                    continue
+                if price > 0:
+                    return price
+        return 0.0
+
+    @staticmethod
+    def _extract_images(card: dict) -> tuple[str | None, str | None]:
+        """Double-faced cards (transform/modal) keep their images on
+        card_faces instead of the top level — use the front face."""
+        uris = card.get("image_uris")
+        if not uris:
+            faces = card.get("card_faces") or []
+            if faces and faces[0].get("image_uris"):
+                uris = faces[0]["image_uris"]
+        if not uris:
+            return None, None
+        return uris.get("small"), uris.get("normal") or uris.get("large")
+
+    def _normalize_card(self, card: dict) -> dict | None:
+        card_id = card.get("id")
+        if not card_id:
+            return None
+        small_image, large_image = self._extract_images(card)
+        return {
+            "card_id": card_id,
+            "card_name": card.get("name"),
+            "set_name": card.get("set_name"),
+            "card_number": card.get("collector_number"),
+            # Scryfall rarities are lowercase ("mythic") — title-case
+            # them so they display like the Pokémon ones.
+            "rarity": (card.get("rarity") or "").title(),
+            "market_price": self._extract_price(card),
+            "small_image": small_image,
+            "large_image": large_image,
+        }
+
+    def search_cards(self, name: str) -> list[dict]:
+        rows: list[dict] = []
+
+        # unique=prints — every PRINTING, not one card per name. Each
+        # printing is a separately collectible card with its own price,
+        # exactly like Pokémon cards across different sets.
+        params: dict | None = {"q": name, "unique": "prints", "order": "name"}
+        url = self.CARDS_API
+
+        for page in range(1, MAX_PAGES + 1):
+            try:
+                response = requests.get(
+                    url,
+                    params=params,
+                    headers=self.HEADERS,
+                    timeout=REQUEST_TIMEOUT,
+                )
+                # Scryfall answers "no cards matched" with a 404 —
+                # that's an empty result, not an error.
+                if response.status_code == 404:
+                    break
+                response.raise_for_status()
+                data = response.json()
+            except requests.RequestException as e:
+                print(f"[{self.game}] API request failed on page {page}: {e}")
+                break
+            except ValueError as e:
+                print(f"[{self.game}] API returned invalid JSON on page {page}: {e}")
+                break
+
+            page_cards = data.get("data") or []
+            print(f"  [{self.game}] fetched page {page}: {len(page_cards)} cards")
+
+            for card in page_cards:
+                row = self._normalize_card(card)
+                if row is not None:
+                    rows.append(row)
+
+            if not data.get("has_more"):
+                break
+            # Scryfall hands us the full next-page URL, query included.
+            url = data.get("next_page")
+            params = None
+            if not url:
+                break
+            time.sleep(0.1)  # polite rate limiting, per Scryfall's docs
+
+        return rows
+
+    def fetch_sets(self) -> list[dict]:
+        rows: list[dict] = []
+        url: str | None = self.SETS_API
+        params: dict | None = None
+
+        while url:
+            response = requests.get(
+                url,
+                params=params,
+                headers=self.HEADERS,
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            for s in data.get("data", []):
+                code = s.get("code")
+                if not code:
+                    continue
+                rows.append(
+                    {
+                        "set_id": code,
+                        "set_name": s.get("name"),
+                        "total": s.get("card_count"),
+                        # printed_size is the official set size when known;
+                        # card_count (everything Scryfall has) is the fallback.
+                        "printed_total": s.get("printed_size") or s.get("card_count"),
+                        "release_date": s.get("released_at"),
+                    }
+                )
+
+            url = data.get("next_page") if data.get("has_more") else None
+            params = None
+            if url:
+                time.sleep(0.1)
+
+        return rows
+
+    def autocomplete(self, q: str) -> list[str]:
+        query = q.strip()
+        if len(query) < 2:
+            return []  # Scryfall wants at least 2 characters
+        try:
+            response = requests.get(
+                self.AUTOCOMPLETE_API,
+                params={"q": query},
+                headers=self.HEADERS,
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            return (response.json().get("data") or [])[:8]
+        except (requests.RequestException, ValueError):
+            return []
+
 
 # The registry of every game EtherDex knows. Adding a game later means
 # writing its adapter and adding one line here.
 GAMES: dict[str, GameAdapter] = {
     "pokemon": PokemonAdapter(),
+    "mtg": MTGAdapter(),
 }
 
 DEFAULT_GAME = "pokemon"
@@ -777,7 +961,7 @@ def root():
 def health():
     return {
         "status": "ok",
-        "version": "3.0",
+        "version": "3.1",
         "games": sorted(GAMES.keys()),
         "api_key_set": bool(API_KEY),
         "clerk_key_set": bool(CLERK_SECRET_KEY),
@@ -794,11 +978,16 @@ def list_games():
 
 @app.get("/pokemon-names")
 def pokemon_names(q: str = ""):
-    query = q.strip().lower()
-    if not query:
-        return {"names": []}
-    matches = [n for n in POKEMON_NAMES if n.lower().startswith(query)]
-    return {"names": matches[:8]}
+    """Kept for the current frontend; /autocomplete is the game-aware
+    version the multi-game frontend will use."""
+    return {"names": GAMES["pokemon"].autocomplete(q)}
+
+
+@app.get("/autocomplete")
+def autocomplete(q: str = "", game: str = "pokemon"):
+    """Game-aware name suggestions for the search box."""
+    adapter = get_adapter(game)
+    return {"names": adapter.autocomplete(q), "game": adapter.game}
 
 
 @app.get("/search")
