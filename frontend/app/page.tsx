@@ -15,8 +15,65 @@ import {
 import useCards from '../hooks/useCards';
 
 const CARDS_PER_PAGE = 24;
-const EXAMPLE_SEARCHES = ['Charizard', 'Pikachu', 'Mewtwo', 'Eevee', 'Rayquaza'];
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
+
+// ---- MULTI-GAME SUPPORT ----
+// The list of games comes from the backend's /games endpoint at runtime,
+// so new games appear in the switcher automatically when adapters ship.
+interface GameInfo {
+  key: string;
+  name: string;
+}
+
+const FALLBACK_GAMES: GameInfo[] = [{ key: 'pokemon', name: 'Pokémon' }];
+
+// Per-game UI text. Unknown games fall back to 'default', so a brand-new
+// adapter works in the UI before this map even knows about it.
+const GAME_UI: Record<
+  string,
+  {
+    placeholder: string;
+    examples: string[];
+    rarities: string[];
+    priceSource: string;
+    tag: string;
+  }
+> = {
+  pokemon: {
+    placeholder: 'Search any Pokémon (e.g. Charizard)...',
+    examples: ['Charizard', 'Pikachu', 'Mewtwo', 'Eevee', 'Rayquaza'],
+    rarities: ['Common', 'Uncommon', 'Rare', 'Promo'],
+    priceSource: 'TCGplayer',
+    tag: 'PKMN',
+  },
+  mtg: {
+    placeholder: 'Search any Magic card (e.g. Lightning Bolt)...',
+    examples: ['Black Lotus', 'Lightning Bolt', 'Sol Ring', 'Counterspell', 'Llanowar Elves'],
+    rarities: ['Common', 'Uncommon', 'Rare', 'Mythic'],
+    priceSource: 'Scryfall',
+    tag: 'MTG',
+  },
+  default: {
+    placeholder: 'Search any card...',
+    examples: [],
+    rarities: ['Common', 'Uncommon', 'Rare'],
+    priceSource: 'market data',
+    tag: 'TCG',
+  },
+};
+
+const gameUI = (key: string) => GAME_UI[key] || GAME_UI.default;
+
+// Turn an ISO timestamp into a friendly "how fresh" label for prices.
+function formatFreshness(iso?: string): string {
+  if (!iso) return 'recently';
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return 'recently';
+  const days = Math.floor((Date.now() - then) / (1000 * 60 * 60 * 24));
+  if (days <= 0) return 'today';
+  if (days === 1) return 'yesterday';
+  return `${days} days ago`;
+}
 
 // The card conditions, with a short description to help users choose.
 const CONDITIONS = [
@@ -155,10 +212,16 @@ interface WatchCard {
   condition?: string;
   quantity?: number;
   target_price?: number | null;
+  game?: string;
+  last_updated?: string;
 }
 
 export default function Home() {
   const { getToken, isSignedIn, isLoaded } = useAuth();
+
+  // Which game is active, and which games the backend supports.
+  const [games, setGames] = useState<GameInfo[]>(FALLBACK_GAMES);
+  const [activeGame, setActiveGame] = useState('pokemon');
 
   const [search, setSearch] = useState('');
   const [searchTerm, setSearchTerm] = useState('');
@@ -186,11 +249,39 @@ export default function Home() {
 
   const { cards, loading, error } = useCards({
     search: searchTerm,
+    game: activeGame,
     sortBy,
     rarityFilter,
     minPrice,
     maxPrice,
   });
+
+  // Load the supported games once — new adapters appear automatically.
+  useEffect(() => {
+    const loadGames = async () => {
+      try {
+        const res = await fetch(`${API_URL}/games`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.games?.length) setGames(data.games);
+        }
+      } catch {
+        // backend unreachable — keep the Pokémon-only fallback
+      }
+    };
+    loadGames();
+  }, []);
+
+  // Switching games keeps the typed search (it re-runs against the new
+  // game automatically) and resets everything tied to the old results.
+  const switchGame = (key: string) => {
+    if (key === activeGame) return;
+    setActiveGame(key);
+    setVisibleCount(CARDS_PER_PAGE);
+    setSetFilter('');
+    setRarityFilter('');
+    setSuggestions([]);
+  };
 
   // --- WATCHLIST: load from the backend when the user is signed in ---
   useEffect(() => {
@@ -246,15 +337,16 @@ export default function Home() {
           prev.filter((c) => c.card_id !== card.card_id)
         );
       } else {
+        const tagged = { ...card, game: card.game || activeGame };
         await fetch(`${API_URL}/watchlist/add`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${token}`,
           },
-          body: JSON.stringify(card),
+          body: JSON.stringify(tagged),
         });
-        setWatchlist((prev) => [...prev, card]);
+        setWatchlist((prev) => [...prev, tagged]);
       }
     } catch {
       alert('Could not update watchlist. Please try again.');
@@ -401,6 +493,7 @@ export default function Home() {
           : 0;
       const quantity = card.quantity ?? 1;
       return {
+        'Game': gameUI(card.game || 'pokemon').tag,
         'Card Name': card.pokemon_name,
         'Set': card.set_name || 'Unknown',
         'Rarity': card.rarity || 'Unknown',
@@ -412,6 +505,7 @@ export default function Home() {
     });
 
     const blank = {
+      'Game': '',
       'Card Name': '', 'Set': '', 'Rarity': '', 'Condition': '',
       'Quantity': '' as unknown as number,
       'Unit Price (USD)': '' as unknown as number,
@@ -419,6 +513,7 @@ export default function Home() {
     };
     rows.push(blank);
     rows.push({
+      'Game': '',
       'Card Name': 'TOTAL',
       'Set': '',
       'Rarity': '',
@@ -430,6 +525,7 @@ export default function Home() {
 
     const worksheet = XLSX.utils.json_to_sheet(rows);
     worksheet['!cols'] = [
+      { wch: 8 },
       { wch: 28 }, { wch: 26 }, { wch: 18 },
       { wch: 16 }, { wch: 10 }, { wch: 16 }, { wch: 16 },
     ];
@@ -459,7 +555,7 @@ export default function Home() {
     const timer = setTimeout(async () => {
       try {
         const res = await fetch(
-          `${API_URL}/pokemon-names?q=${encodeURIComponent(term)}`
+          `${API_URL}/autocomplete?q=${encodeURIComponent(term)}&game=${activeGame}`
         );
         const data = await res.json();
         setSuggestions(data.names || []);
@@ -468,7 +564,7 @@ export default function Home() {
       }
     }, 200);
     return () => clearTimeout(timer);
-  }, [search]);
+  }, [search, activeGame]);
 
   const availableSets = useMemo(() => {
     const sets = new Set<string>();
@@ -573,12 +669,30 @@ export default function Home() {
       {/* BODY */}
       <div className="flex-1 max-w-7xl mx-auto w-full px-6 py-8">
 
+        {/* GAME SWITCHER */}
+        <div className="flex flex-wrap gap-2 mb-5">
+          {games.map((g) => (
+            <button
+              key={g.key}
+              onClick={() => switchGame(g.key)}
+              className={
+                'px-5 py-2.5 rounded-full text-sm font-semibold border transition-colors ' +
+                (activeGame === g.key
+                  ? 'bg-yellow-400 text-black border-yellow-400'
+                  : 'bg-zinc-900 text-zinc-300 border-zinc-800 hover:border-yellow-500 hover:text-yellow-400')
+              }
+            >
+              {g.name}
+            </button>
+          ))}
+        </div>
+
         {/* SEARCH + AUTOCOMPLETE */}
         <div className="flex gap-3 mb-6">
           <div className="flex-1 relative">
             <input
               type="text"
-              placeholder="Search any Pokémon (e.g. Charizard)..."
+              placeholder={gameUI(activeGame).placeholder}
               value={search}
               onChange={(e) => {
                 setSearch(e.target.value);
@@ -632,10 +746,11 @@ export default function Home() {
 
           <select value={rarityFilter} onChange={(e) => setRarityFilter(e.target.value)} className={controlClass}>
             <option value="">All Rarities</option>
-            <option value="common">Common</option>
-            <option value="uncommon">Uncommon</option>
-            <option value="rare">Rare</option>
-            <option value="promo">Promo</option>
+            {gameUI(activeGame).rarities.map((r) => (
+              <option key={r} value={r.toLowerCase()}>
+                {r}
+              </option>
+            ))}
           </select>
 
           <select
@@ -683,7 +798,7 @@ export default function Home() {
 
         {!loading && !error && filteredCards.length === 0 && searchTerm && (
           <p className="text-center text-zinc-500 text-lg my-12">
-            No cards found. Try another Pokémon.
+            No cards found. Try another name.
           </p>
         )}
 
@@ -696,7 +811,7 @@ export default function Home() {
             </div>
 
             <h2 className="text-2xl md:text-3xl font-semibold mb-2">
-              Track what your Pokémon cards are worth
+              Track what your cards are worth
             </h2>
             <p className="text-zinc-500 mb-10 max-w-xl mx-auto">
               Search any card to see live prices, rarities, and sets — then build
@@ -731,7 +846,7 @@ export default function Home() {
 
             <p className="text-zinc-500 mb-4">Try one of these:</p>
             <div className="flex flex-wrap justify-center gap-3">
-              {EXAMPLE_SEARCHES.map((name) => (
+              {gameUI(activeGame).examples.map((name) => (
                 <button
                   key={name}
                   onClick={() => runSearch(name)}
@@ -946,6 +1061,9 @@ export default function Home() {
                         <div className="flex-1 min-w-0">
                           <p className="font-semibold truncate">{card.pokemon_name}</p>
                           <p className="text-zinc-500 text-xs truncate">
+                            <span className="text-zinc-600 font-semibold mr-1">
+                              {gameUI(card.game || 'pokemon').tag}
+                            </span>
                             {card.set_name || 'Unknown set'}
                           </p>
                           <p className="text-yellow-400 font-bold mt-1">
@@ -1179,11 +1297,18 @@ export default function Home() {
                 </div>
                 <div className="flex justify-between border-b border-zinc-800 pb-2">
                   <span className="text-zinc-500">Market Price</span>
-                  <span className="text-yellow-400 text-2xl font-bold">
-                    {selectedCard.market_price && selectedCard.market_price > 0
-                      ? `$${Number(selectedCard.market_price).toFixed(2)}`
-                      : 'No price'}
-                  </span>
+                  <div className="text-right">
+                    <span className="text-yellow-400 text-2xl font-bold">
+                      {selectedCard.market_price && selectedCard.market_price > 0
+                        ? `$${Number(selectedCard.market_price).toFixed(2)}`
+                        : 'No price'}
+                    </span>
+                    <p className="text-zinc-500 text-xs mt-1">
+                      Price from {gameUI(selectedCard.game || 'pokemon').priceSource}
+                      {' · updated '}
+                      {formatFreshness(selectedCard.last_updated)}
+                    </p>
+                  </div>
                 </div>
               </div>
 

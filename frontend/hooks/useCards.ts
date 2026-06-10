@@ -11,10 +11,14 @@ interface Card {
   market_price: number;
   small_image: string;
   large_image: string;
+  game?: string;
+  card_name?: string;
+  last_updated?: string;
 }
 
 interface UseCardsProps {
   search: string;
+  game: string;
   sortBy: string;
   rarityFilter: string;
   minPrice: string;
@@ -23,6 +27,7 @@ interface UseCardsProps {
 
 export default function useCards({
   search,
+  game,
   sortBy,
   rarityFilter,
   minPrice,
@@ -50,6 +55,7 @@ export default function useCards({
         const params = new URLSearchParams();
 
         params.append('name', safeSearch);
+        params.append('game', game);
 
         if (sortBy) {
           params.append('sort', sortBy);
@@ -98,7 +104,7 @@ export default function useCards({
     };
 
     fetchCards();
-  }, [search, sortBy, rarityFilter, minPrice, maxPrice]);
+  }, [search, game, sortBy, rarityFilter, minPrice, maxPrice]);
 
   return {
     cards,
