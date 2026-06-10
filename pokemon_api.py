@@ -1,17 +1,28 @@
 # pokemon_api.py
 # ---------------------------------------------------------------------------
-# Pokémon Card Price Checker — backend.
+# EtherDex — backend. (v3.0 — the multi-TCG foundation)
+#
+# ARCHITECTURE NOTE (the Phase 1 refactor):
+# EtherDex now supports multiple card games through GAME ADAPTERS. Each
+# game (Pokémon, MTG, Yu-Gi-Oh, One Piece...) is a pluggable data source
+# that knows how to fetch and normalize ITS cards and sets. Everything
+# downstream — the database, search, watchlist, dashboard — is
+# game-agnostic and just works with normalized rows tagged by game.
+#
+# Isolation rule: one game's data source breaking must NEVER take down
+# the others. Network failures are caught per-adapter, and cached data
+# in SQLite keeps serving even when a source is down.
 #
 # Includes:
-#   - Card search (Pokémon TCG API + local DB cache, with freshness TTL)
-#   - Autocomplete name suggestions
+#   - GAME ADAPTERS (Pokémon today; MTG, Yu-Gi-Oh, One Piece to come)
+#   - Card search (per-game API + local DB cache, with freshness TTL)
+#   - Autocomplete name suggestions (Pokémon names; per-game later)
 #   - Per-user WATCHLIST, stored in the database, protected by Clerk auth
 #   - Per-card CONDITION (Near Mint, Lightly Played, etc.)
 #   - Per-card QUANTITY owned (how many copies the user has)
-#   - PRICE SNAPSHOTS — a dated price record every time cards are fetched,
-#     so we can show price history over time.
-#   - SET DATA — each set's card count, for set-completion tracking.
-#   - PRICE ALERTS — an optional target price per watchlist card.
+#   - PRICE SNAPSHOTS — a dated price record every time cards are fetched
+#   - SET DATA — each set's card count, for set-completion tracking
+#   - PRICE ALERTS — an optional target price per watchlist card
 # ---------------------------------------------------------------------------
 
 import os
@@ -37,8 +48,6 @@ import httpx
 # ---------------------------------------------------------------------------
 
 DATABASE = "pokemon_cards.db"
-POKEMON_TCG_API = "https://api.pokemontcg.io/v2/cards"
-SETS_API = "https://api.pokemontcg.io/v2/sets"
 PAGE_SIZE = 250
 MAX_PAGES = 20
 REQUEST_TIMEOUT = 20
@@ -62,7 +71,7 @@ ALLOWED_CONDITIONS = {
 
 clerk_client = Clerk(bearer_auth=CLERK_SECRET_KEY)
 
-app = FastAPI(title="Pokemon Card Price API", version="2.5")
+app = FastAPI(title="EtherDex API", version="3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -74,7 +83,190 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
+# SMALL SHARED HELPERS
+# ---------------------------------------------------------------------------
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _today_str() -> str:
+    """Today's date as YYYY-MM-DD (UTC) — used as the snapshot date."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+# ---------------------------------------------------------------------------
+# GAME ADAPTERS
+#
+# Every game EtherDex supports is one adapter class. An adapter's job is
+# small and strict: talk to that game's API and return NORMALIZED rows.
+#
+# A normalized CARD row is a dict with exactly these keys:
+#   card_id, card_name, set_name, card_number, rarity,
+#   market_price, small_image, large_image
+#
+# A normalized SET row is a dict with exactly these keys:
+#   set_id, set_name, total, printed_total, release_date
+#
+# Nothing outside this section knows or cares which game's API is on the
+# other end. To add a new game later: write an adapter, register it in
+# GAMES. That's the whole job.
+# ---------------------------------------------------------------------------
+
+
+class GameAdapter:
+    """Base class for game data sources."""
+
+    game: str = ""  # short key stored in the database, e.g. "pokemon"
+    display_name: str = ""  # human-friendly name, e.g. "Pokémon"
+
+    def search_cards(self, name: str) -> list[dict]:
+        """Fetch cards matching a name. Returns normalized card rows.
+        Network errors should be handled INSIDE the adapter — return
+        whatever was fetched successfully (possibly an empty list)."""
+        raise NotImplementedError
+
+    def fetch_sets(self) -> list[dict]:
+        """Fetch every set for this game. Returns normalized set rows.
+        MAY raise requests.RequestException — the sync layer catches it
+        per-adapter, so one game's failure never affects the others."""
+        raise NotImplementedError
+
+
+class PokemonAdapter(GameAdapter):
+    """Pokémon TCG, via the official pokemontcg.io API."""
+
+    game = "pokemon"
+    display_name = "Pokémon"
+
+    CARDS_API = "https://api.pokemontcg.io/v2/cards"
+    SETS_API = "https://api.pokemontcg.io/v2/sets"
+
+    def _headers(self) -> dict:
+        return {"X-Api-Key": API_KEY} if API_KEY else {}
+
+    @staticmethod
+    def _extract_market_price(card: dict) -> float:
+        tcgplayer = card.get("tcgplayer") or {}
+        prices = tcgplayer.get("prices") or {}
+        for price_data in prices.values():
+            if isinstance(price_data, dict):
+                market = price_data.get("market")
+                if isinstance(market, (int, float)) and market > 0:
+                    return float(market)
+        return 0.0
+
+    def _normalize_card(self, card: dict) -> dict | None:
+        card_id = card.get("id")
+        if not card_id:
+            return None
+        images = card.get("images") or {}
+        card_set = card.get("set") or {}
+        return {
+            "card_id": card_id,
+            "card_name": card.get("name"),
+            "set_name": card_set.get("name"),
+            "card_number": card.get("number"),
+            "rarity": card.get("rarity"),
+            "market_price": self._extract_market_price(card),
+            "small_image": images.get("small"),
+            "large_image": images.get("large"),
+        }
+
+    def search_cards(self, name: str) -> list[dict]:
+        query_string = f'name:"*{name}*"'
+        rows: list[dict] = []
+
+        for page in range(1, MAX_PAGES + 1):
+            try:
+                response = requests.get(
+                    self.CARDS_API,
+                    params={
+                        "q": query_string,
+                        "pageSize": PAGE_SIZE,
+                        "page": page,
+                    },
+                    headers=self._headers(),
+                    timeout=REQUEST_TIMEOUT,
+                )
+                response.raise_for_status()
+                data = response.json()
+            except requests.RequestException as e:
+                print(f"[{self.game}] API request failed on page {page}: {e}")
+                break
+            except ValueError as e:
+                print(f"[{self.game}] API returned invalid JSON on page {page}: {e}")
+                break
+
+            page_cards = data.get("data") or []
+            if not page_cards:
+                break
+
+            print(f"  [{self.game}] fetched page {page}: {len(page_cards)} cards")
+
+            for card in page_cards:
+                row = self._normalize_card(card)
+                if row is not None:
+                    rows.append(row)
+
+            if len(page_cards) < PAGE_SIZE:
+                break
+
+        return rows
+
+    def fetch_sets(self) -> list[dict]:
+        # ~165 sets exist; one page of 250 covers them all comfortably.
+        response = requests.get(
+            self.SETS_API,
+            params={"pageSize": 250},
+            headers=self._headers(),
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        rows: list[dict] = []
+        for s in data.get("data", []):
+            set_id = s.get("id")
+            if not set_id:
+                continue
+            rows.append(
+                {
+                    "set_id": set_id,
+                    "set_name": s.get("name"),
+                    "total": s.get("total"),
+                    "printed_total": s.get("printedTotal"),
+                    "release_date": s.get("releaseDate"),
+                }
+            )
+        return rows
+
+
+# The registry of every game EtherDex knows. Adding a game later means
+# writing its adapter and adding one line here.
+GAMES: dict[str, GameAdapter] = {
+    "pokemon": PokemonAdapter(),
+}
+
+DEFAULT_GAME = "pokemon"
+
+
+def get_adapter(game: str | None) -> GameAdapter:
+    """Look up a game's adapter, or 400 if the game isn't supported."""
+    key = (game or DEFAULT_GAME).strip().lower()
+    adapter = GAMES.get(key)
+    if adapter is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown game '{game}'. Available: {', '.join(sorted(GAMES))}.",
+        )
+    return adapter
+
+
+# ---------------------------------------------------------------------------
 # POKÉMON NAME LIST (for autocomplete)
+# (Pokémon-specific for now; becomes per-game in a later phase.)
 # ---------------------------------------------------------------------------
 
 
@@ -104,14 +296,23 @@ POKEMON_NAMES = load_pokemon_names()
 
 
 def init_db() -> None:
-    """Create the cards, watchlist, price_snapshots, and sets tables."""
+    """
+    Create the cards, watchlist, price_snapshots, and sets tables, and
+    run the v3.0 multi-game migrations on databases created by earlier
+    versions. Every migration is safe and preserves existing data.
+    """
     conn = sqlite3.connect(DATABASE)
 
-    # Cards cache table.
+    # Cards cache table. One row per card, tagged with its game.
+    # Note on the primary key: card_id formats can't collide across our
+    # supported games (Pokémon "swsh4-25", MTG UUIDs, Yu-Gi-Oh numeric
+    # ids), so card_id alone stays the key — which also keeps watchlist
+    # and price_snapshots references simple.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS cards (
             card_id       TEXT PRIMARY KEY,
-            pokemon_name  TEXT,
+            game          TEXT NOT NULL DEFAULT 'pokemon',
+            card_name     TEXT,
             set_name      TEXT,
             card_number   TEXT,
             rarity        TEXT,
@@ -121,7 +322,26 @@ def init_db() -> None:
             last_updated  TEXT
         )
         """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_pokemon_name ON cards(pokemon_name)")
+
+    # MIGRATION (pre-3.0 databases): pokemon_name becomes the
+    # game-neutral card_name. Data is preserved by the rename.
+    try:
+        conn.execute("ALTER TABLE cards RENAME COLUMN pokemon_name TO card_name")
+    except sqlite3.OperationalError:
+        pass  # already renamed (or fresh install)
+
+    # MIGRATION (pre-3.0 databases): tag every existing card as Pokémon.
+    try:
+        conn.execute(
+            "ALTER TABLE cards ADD COLUMN game TEXT NOT NULL DEFAULT 'pokemon'"
+        )
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+    # The old name-index is replaced by game-aware indexes.
+    conn.execute("DROP INDEX IF EXISTS idx_pokemon_name")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_card_name ON cards(card_name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cards_game ON cards(game)")
 
     # Watchlist table — one row per (user, card).
     conn.execute("""
@@ -159,6 +379,14 @@ def init_db() -> None:
     except sqlite3.OperationalError:
         pass  # column already exists
 
+    # MIGRATION (pre-3.0): tag every existing watchlist row as Pokémon.
+    try:
+        conn.execute(
+            "ALTER TABLE watchlist ADD COLUMN game TEXT NOT NULL " "DEFAULT 'pokemon'"
+        )
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
     # price_snapshots — one row per (card, date). Records what a card's
     # market price was on a given day, so we can build price-history charts.
     conn.execute("""
@@ -173,18 +401,51 @@ def init_db() -> None:
         "CREATE INDEX IF NOT EXISTS idx_snapshot_card " "ON price_snapshots(card_id)"
     )
 
-    # sets — one row per Pokémon set, with its total card count.
+    # sets — one row per set PER GAME, with its total card count.
     # Powers set-completion tracking on the dashboard.
+    # The primary key is (game, set_id) because short set codes CAN
+    # collide across games (Pokémon "neo1" vs MTG "neo" style codes).
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sets (
-            set_id         TEXT PRIMARY KEY,
+            game           TEXT NOT NULL DEFAULT 'pokemon',
+            set_id         TEXT NOT NULL,
             set_name       TEXT,
             total          INTEGER,
             printed_total  INTEGER,
             release_date   TEXT,
-            last_synced    TEXT
+            last_synced    TEXT,
+            PRIMARY KEY (game, set_id)
         )
         """)
+
+    # MIGRATION (pre-3.0 databases): the old sets table had set_id as its
+    # primary key and no game column. Rebuild it with the composite key,
+    # carrying every existing row over tagged as Pokémon.
+    set_cols = [row[1] for row in conn.execute("PRAGMA table_info(sets)")]
+    if set_cols and "game" not in set_cols:
+        conn.execute("ALTER TABLE sets RENAME TO sets_old")
+        conn.execute("""
+            CREATE TABLE sets (
+                game           TEXT NOT NULL DEFAULT 'pokemon',
+                set_id         TEXT NOT NULL,
+                set_name       TEXT,
+                total          INTEGER,
+                printed_total  INTEGER,
+                release_date   TEXT,
+                last_synced    TEXT,
+                PRIMARY KEY (game, set_id)
+            )
+            """)
+        conn.execute("""
+            INSERT INTO sets
+            (game, set_id, set_name, total, printed_total,
+             release_date, last_synced)
+            SELECT 'pokemon', set_id, set_name, total, printed_total,
+                   release_date, last_synced
+            FROM sets_old
+            """)
+        conn.execute("DROP TABLE sets_old")
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_set_name ON sets(set_name)")
 
     conn.commit()
@@ -234,50 +495,12 @@ def get_user_id(authorization: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# CARD SEARCH HELPERS
+# GENERIC SYNC + QUERY LAYER (game-agnostic)
+#
+# These functions work for EVERY game. They take an adapter (or a game
+# key), store normalized rows tagged with the game, and read them back
+# filtered by game. No game-specific logic lives here.
 # ---------------------------------------------------------------------------
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _today_str() -> str:
-    """Today's date as YYYY-MM-DD (UTC) — used as the snapshot date."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-
-def _api_headers() -> dict:
-    return {"X-Api-Key": API_KEY} if API_KEY else {}
-
-
-def extract_market_price(card: dict) -> float:
-    tcgplayer = card.get("tcgplayer") or {}
-    prices = tcgplayer.get("prices") or {}
-    for price_data in prices.values():
-        if isinstance(price_data, dict):
-            market = price_data.get("market")
-            if isinstance(market, (int, float)) and market > 0:
-                return float(market)
-    return 0.0
-
-
-def _row_from_api_card(card: dict) -> dict | None:
-    card_id = card.get("id")
-    if not card_id:
-        return None
-    images = card.get("images") or {}
-    card_set = card.get("set") or {}
-    return {
-        "card_id": card_id,
-        "pokemon_name": card.get("name"),
-        "set_name": card_set.get("name"),
-        "card_number": card.get("number"),
-        "rarity": card.get("rarity"),
-        "market_price": extract_market_price(card),
-        "small_image": images.get("small"),
-        "large_image": images.get("large"),
-    }
 
 
 def record_snapshot(conn: sqlite3.Connection, card_id: str, price: float) -> None:
@@ -300,13 +523,15 @@ def record_snapshot(conn: sqlite3.Connection, card_id: str, price: float) -> Non
     )
 
 
-def is_data_fresh(name: str) -> bool:
+def is_data_fresh(game: str, name: str) -> bool:
+    """True if this game's cached cards matching the name are all fresh."""
     conn = sqlite3.connect(DATABASE)
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT MIN(last_updated) FROM cards WHERE pokemon_name LIKE ?",
-            (f"%{name}%",),
+            "SELECT MIN(last_updated) FROM cards "
+            "WHERE game = ? AND card_name LIKE ?",
+            (game, f"%{name}%"),
         )
         oldest = cursor.fetchone()[0]
     finally:
@@ -322,99 +547,82 @@ def is_data_fresh(name: str) -> bool:
     return oldest_dt >= cutoff
 
 
-def fetch_from_api(name: str) -> int:
-    timestamp = _now_iso()
-    query_string = f'name:"*{name}*"'
-    total = 0
+def refresh_cards(adapter: GameAdapter, name: str) -> int:
+    """
+    Fetch cards matching a name through the game's adapter and store
+    them (tagged with the game), recording today's price snapshots.
+    """
+    rows = adapter.search_cards(name)
+    if not rows:
+        print(f"[{adapter.game}] no cards fetched for '{name}'")
+        return 0
 
+    timestamp = _now_iso()
     conn = sqlite3.connect(DATABASE)
     try:
-        for page in range(1, MAX_PAGES + 1):
-            try:
-                response = requests.get(
-                    POKEMON_TCG_API,
-                    params={
-                        "q": query_string,
-                        "pageSize": PAGE_SIZE,
-                        "page": page,
-                    },
-                    headers=_api_headers(),
-                    timeout=REQUEST_TIMEOUT,
-                )
-                response.raise_for_status()
-                data = response.json()
-            except requests.RequestException as e:
-                print(f"Pokemon TCG API request failed on page {page}: {e}")
-                break
-            except ValueError as e:
-                print(f"Pokemon TCG API returned invalid JSON on page {page}: {e}")
-                break
-
-            page_cards = data.get("data") or []
-            if not page_cards:
-                break
-
-            print(f"  fetched page {page}: {len(page_cards)} cards")
-
-            for card in page_cards:
-                row = _row_from_api_card(card)
-                if row is None:
-                    continue
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO cards
-                    (card_id, pokemon_name, set_name, card_number,
-                     rarity, market_price, small_image, large_image,
-                     last_updated)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        row["card_id"],
-                        row["pokemon_name"],
-                        row["set_name"],
-                        row["card_number"],
-                        row["rarity"],
-                        row["market_price"],
-                        row["small_image"],
-                        row["large_image"],
-                        timestamp,
-                    ),
-                )
-                # Record today's price snapshot for this card.
-                record_snapshot(conn, row["card_id"], row["market_price"])
-                total += 1
-
-            if len(page_cards) < PAGE_SIZE:
-                break
-
+        for row in rows:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO cards
+                (card_id, game, card_name, set_name, card_number,
+                 rarity, market_price, small_image, large_image,
+                 last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["card_id"],
+                    adapter.game,
+                    row["card_name"],
+                    row["set_name"],
+                    row["card_number"],
+                    row["rarity"],
+                    row["market_price"],
+                    row["small_image"],
+                    row["large_image"],
+                    timestamp,
+                ),
+            )
+            # Record today's price snapshot for this card.
+            record_snapshot(conn, row["card_id"], row["market_price"])
         conn.commit()
     finally:
         conn.close()
 
-    print(f"Total cards fetched for '{name}': {total}")
-    return total
+    print(f"[{adapter.game}] total cards stored for '{name}': {len(rows)}")
+    return len(rows)
 
 
 def query_local_db(
+    game: str,
     name: str,
     rarity: str,
     sort: str,
     min_price: float,
     max_price: float,
 ) -> list[dict]:
+    """
+    Read cards for one game from the local cache.
+
+    NOTE: card_name is ALSO returned as pokemon_name. That keeps the
+    current frontend working unchanged through the refactor; the alias
+    is dropped once the frontend moves to card_name in a later phase.
+    """
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     try:
         query = """
-            SELECT card_id, pokemon_name, set_name, card_number,
+            SELECT card_id, game, card_name,
+                   card_name AS pokemon_name,
+                   set_name, card_number,
                    rarity, market_price, small_image, large_image,
                    last_updated
             FROM cards
-            WHERE pokemon_name LIKE ?
+            WHERE game = ?
+            AND card_name LIKE ?
             AND market_price >= ?
             AND market_price <= ?
         """
-        params: list = [f"%{name}%", min_price, max_price]
+        params: list = [game, f"%{name}%", min_price, max_price]
 
         if rarity:
             query += " AND rarity LIKE ? "
@@ -425,9 +633,9 @@ def query_local_db(
         elif sort == "price_asc":
             query += " ORDER BY market_price ASC "
         elif sort == "name_asc":
-            query += " ORDER BY pokemon_name ASC "
+            query += " ORDER BY card_name ASC "
         elif sort == "name_desc":
-            query += " ORDER BY pokemon_name DESC "
+            query += " ORDER BY card_name DESC "
 
         cursor = conn.cursor()
         cursor.execute(query, params)
@@ -437,17 +645,12 @@ def query_local_db(
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# SET DATA — card counts per set, for set-completion tracking
-# ---------------------------------------------------------------------------
-
-
-def sets_need_sync() -> bool:
-    """True if the sets table is empty or hasn't been synced recently."""
+def sets_need_sync(game: str) -> bool:
+    """True if this game's sets are missing or haven't synced recently."""
     conn = sqlite3.connect(DATABASE)
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT MAX(last_synced) FROM sets")
+        cursor.execute("SELECT MAX(last_synced) FROM sets WHERE game = ?", (game,))
         newest = cursor.fetchone()[0]
     finally:
         conn.close()
@@ -462,68 +665,60 @@ def sets_need_sync() -> bool:
     return newest_dt < cutoff
 
 
-def sync_sets() -> None:
+def sync_all_sets() -> None:
     """
-    Fetch every Pokémon set's card count from the API and store it.
-    Skips if set data was already synced recently. Network failure here
-    is non-fatal — it just retries on the next startup.
+    Sync set data for EVERY registered game, one adapter at a time.
+
+    THE ISOLATION BOUNDARY LIVES HERE: each adapter syncs inside its own
+    try/except, so one game's API being down never affects the others.
+    Failures are non-fatal — that game just retries on the next startup,
+    and its cached set data keeps serving in the meantime.
     """
-    if not sets_need_sync():
-        print("Set data is fresh — skipping set sync.")
-        return
+    for adapter in GAMES.values():
+        if not sets_need_sync(adapter.game):
+            print(f"[{adapter.game}] set data is fresh — skipping set sync.")
+            continue
 
-    print("Syncing Pokémon set data from the API...")
-    try:
-        # ~165 sets exist; one page of 250 covers them all comfortably.
-        response = requests.get(
-            SETS_API,
-            params={"pageSize": 250},
-            headers=_api_headers(),
-            timeout=REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-        data = response.json()
-    except requests.RequestException as e:
-        print(f"Set sync failed (will retry next start): {e}")
-        return
-    except ValueError as e:
-        print(f"Set sync returned invalid JSON: {e}")
-        return
+        print(f"[{adapter.game}] syncing set data from the API...")
+        try:
+            rows = adapter.fetch_sets()
+        except requests.RequestException as e:
+            print(f"[{adapter.game}] set sync failed (will retry next start): {e}")
+            continue
+        except ValueError as e:
+            print(f"[{adapter.game}] set sync returned invalid JSON: {e}")
+            continue
 
-    timestamp = _now_iso()
-    conn = sqlite3.connect(DATABASE)
-    try:
-        count = 0
-        for s in data.get("data", []):
-            set_id = s.get("id")
-            if not set_id:
-                continue
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO sets
-                (set_id, set_name, total, printed_total,
-                 release_date, last_synced)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    set_id,
-                    s.get("name"),
-                    s.get("total"),
-                    s.get("printedTotal"),
-                    s.get("releaseDate"),
-                    timestamp,
-                ),
-            )
-            count += 1
-        conn.commit()
-    finally:
-        conn.close()
+        timestamp = _now_iso()
+        conn = sqlite3.connect(DATABASE)
+        try:
+            for row in rows:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO sets
+                    (game, set_id, set_name, total, printed_total,
+                     release_date, last_synced)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        adapter.game,
+                        row["set_id"],
+                        row["set_name"],
+                        row["total"],
+                        row["printed_total"],
+                        row["release_date"],
+                        timestamp,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
 
-    print(f"Synced {count} Pokémon sets.")
+        print(f"[{adapter.game}] synced {len(rows)} sets.")
 
 
-# Sync set data once at startup (skips automatically if already fresh).
-sync_sets()
+# Sync set data once at startup (each game skips automatically if fresh).
+sync_all_sets()
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +727,9 @@ sync_sets()
 
 
 class WatchCardIn(BaseModel):
-    """The card data the frontend sends when adding to the watchlist."""
+    """The card data the frontend sends when adding to the watchlist.
+    `game` defaults to pokemon so the current frontend (which doesn't
+    send it yet) keeps working unchanged."""
 
     card_id: str
     pokemon_name: str
@@ -541,6 +738,7 @@ class WatchCardIn(BaseModel):
     market_price: float | None = 0
     small_image: str | None = ""
     large_image: str | None = ""
+    game: str | None = "pokemon"
 
 
 class ConditionUpdateIn(BaseModel):
@@ -566,23 +764,32 @@ class TargetUpdateIn(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# ROUTES — search
+# ROUTES — general
 # ---------------------------------------------------------------------------
 
 
 @app.get("/")
 def root():
-    return {"message": "Pokemon API is running!"}
+    return {"message": "EtherDex API is running!"}
 
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
+        "version": "3.0",
+        "games": sorted(GAMES.keys()),
         "api_key_set": bool(API_KEY),
         "clerk_key_set": bool(CLERK_SECRET_KEY),
         "freshness_days": FRESHNESS_DAYS,
     }
+
+
+@app.get("/games")
+def list_games():
+    """Every game EtherDex supports — the frontend's game switcher will
+    be built from this list in a later phase."""
+    return {"games": [{"key": a.game, "name": a.display_name} for a in GAMES.values()]}
 
 
 @app.get("/pokemon-names")
@@ -601,19 +808,24 @@ def search_cards(
     sort: str = "",
     min_price: float = 0,
     max_price: float = 999999,
+    game: str = "pokemon",
 ):
+    """Game-aware search. `game` defaults to pokemon, so the current
+    frontend keeps working without sending it."""
+    adapter = get_adapter(game)
+
     name = name.strip()
     if not name:
         return {"cards": []}
 
-    if is_data_fresh(name):
-        print(f"'{name}' — serving fresh data from DB.")
+    if is_data_fresh(adapter.game, name):
+        print(f"[{adapter.game}] '{name}' — serving fresh data from DB.")
     else:
-        print(f"'{name}' — data missing or stale, fetching from API...")
-        fetch_from_api(name)
+        print(f"[{adapter.game}] '{name}' — data missing or stale, fetching...")
+        refresh_cards(adapter, name)
 
-    results = query_local_db(name, rarity, sort, min_price, max_price)
-    return {"cards": results, "count": len(results)}
+    results = query_local_db(adapter.game, name, rarity, sort, min_price, max_price)
+    return {"cards": results, "count": len(results), "game": adapter.game}
 
 
 @app.get("/price-history/{card_id}")
@@ -651,7 +863,8 @@ def get_watchlist(authorization: str | None = Header(default=None)):
     Each card's price is the CURRENT price from the cards table (kept
     fresh by searches) rather than the price frozen when the card was
     added. Condition, quantity, and the price-alert target come from
-    the watchlist row.
+    the watchlist row. The JOIN matches on game as well as card_id so
+    cards from different games can never cross wires.
     """
     user_id = get_user_id(authorization)
 
@@ -662,10 +875,12 @@ def get_watchlist(authorization: str | None = Header(default=None)):
         cursor.execute(
             """
             SELECT w.card_json, w.condition, w.quantity, w.target_price,
+                   w.game,
                    c.market_price AS current_price,
                    c.last_updated AS price_updated
             FROM watchlist w
-            LEFT JOIN cards c ON w.card_id = c.card_id
+            LEFT JOIN cards c
+                   ON w.card_id = c.card_id AND w.game = c.game
             WHERE w.user_id = ?
             ORDER BY w.added_at
             """,
@@ -681,6 +896,10 @@ def get_watchlist(authorization: str | None = Header(default=None)):
         card["condition"] = row["condition"]
         card["quantity"] = row["quantity"]
         card["target_price"] = row["target_price"]
+        card["game"] = row["game"]
+        # card_name mirrors pokemon_name so newer consumers can use the
+        # game-neutral key; the frontend still reads pokemon_name today.
+        card["card_name"] = card.get("card_name") or card.get("pokemon_name")
 
         # Use the current price from the cards table when we have one;
         # fall back to the price stored at add-time if we don't.
@@ -700,18 +919,21 @@ def add_to_watchlist(
     card: WatchCardIn,
     authorization: str | None = Header(default=None),
 ):
-    """Add a card to the signed-in user's watchlist."""
+    """Add a card to the signed-in user's watchlist, tagged with its game."""
     user_id = get_user_id(authorization)
+
+    # Validate the game (defaults to pokemon for the current frontend).
+    adapter = get_adapter(card.game)
 
     conn = sqlite3.connect(DATABASE)
     try:
         conn.execute(
             """
             INSERT OR REPLACE INTO watchlist
-            (user_id, card_id, card_json, added_at)
-            VALUES (?, ?, ?, ?)
+            (user_id, card_id, card_json, added_at, game)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (user_id, card.card_id, card.model_dump_json(), _now_iso()),
+            (user_id, card.card_id, card.model_dump_json(), _now_iso(), adapter.game),
         )
         conn.commit()
     finally:
@@ -810,6 +1032,11 @@ def update_target(
         "card_id": payload.card_id,
         "target_price": target,
     }
+
+
+# ---------------------------------------------------------------------------
+# ROUTES — collection (require a signed-in user)
+# ---------------------------------------------------------------------------
 
 
 @app.get("/collection/history")
@@ -924,6 +1151,9 @@ def collection_sets(authorization: str | None = Header(default=None)):
     """
     Set-completion data: for each set the user owns cards from, how many
     distinct cards they have vs. how many the set contains.
+
+    Game-aware: a set's total is looked up within the card's own game,
+    so identically-named sets in different games can never collide.
     """
     user_id = get_user_id(authorization)
 
@@ -934,52 +1164,55 @@ def collection_sets(authorization: str | None = Header(default=None)):
 
         # The user's watchlist cards (each row = one distinct card).
         cursor.execute(
-            "SELECT card_json FROM watchlist WHERE user_id = ?",
+            "SELECT card_json, game FROM watchlist WHERE user_id = ?",
             (user_id,),
         )
         watch_rows = cursor.fetchall()
 
-        # Count how many distinct cards the user owns per set name.
-        owned_by_set: dict[str, int] = {}
+        # Count distinct cards owned per (game, set name).
+        owned_by_set: dict[tuple[str, str], int] = {}
         for row in watch_rows:
             info = json.loads(row["card_json"])
             set_name = info.get("set_name")
+            game = row["game"] or DEFAULT_GAME
             if set_name:
-                owned_by_set[set_name] = owned_by_set.get(set_name, 0) + 1
+                key = (game, set_name)
+                owned_by_set[key] = owned_by_set.get(key, 0) + 1
 
         if not owned_by_set:
             return {"sets": []}
 
-        # Look up the total card count for each of those sets.
-        set_names = list(owned_by_set.keys())
-        placeholders = ",".join("?" for _ in set_names)
-        cursor.execute(
-            f"""
-            SELECT set_name, printed_total, total
-            FROM sets
-            WHERE set_name IN ({placeholders})
-            """,
-            set_names,
-        )
-        set_rows = cursor.fetchall()
+        # Look up each set's total card count, within its own game.
+        totals: dict[tuple[str, str], int] = {}
+        games_in_watchlist = {g for (g, _) in owned_by_set}
+        for game in games_in_watchlist:
+            names = [n for (g, n) in owned_by_set if g == game]
+            placeholders = ",".join("?" for _ in names)
+            cursor.execute(
+                f"""
+                SELECT set_name, printed_total, total
+                FROM sets
+                WHERE game = ? AND set_name IN ({placeholders})
+                """,
+                [game, *names],
+            )
+            for row in cursor.fetchall():
+                totals[(game, row["set_name"])] = (
+                    row["printed_total"] or row["total"] or 0
+                )
     finally:
         conn.close()
 
-    # printed_total is the official set size (e.g. "102"); fall back to
-    # total (which includes secret rares) if it's missing.
-    totals = {
-        row["set_name"]: (row["printed_total"] or row["total"] or 0) for row in set_rows
-    }
-
     results = []
-    for set_name, owned in owned_by_set.items():
-        total = totals.get(set_name, 0)
+    for (game, set_name), owned in owned_by_set.items():
+        total = totals.get((game, set_name), 0)
         # Cap owned at the set size so the display never shows over 100%.
         owned_display = min(owned, total) if total else owned
         percent = round((owned_display / total) * 100) if total else 0
         results.append(
             {
                 "set_name": set_name,
+                "game": game,
                 "owned": owned_display,
                 "total": total,
                 "percent": percent,
