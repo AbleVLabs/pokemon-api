@@ -11,6 +11,7 @@
 #   - PRICE SNAPSHOTS — a dated price record every time cards are fetched,
 #     so we can show price history over time.
 #   - SET DATA — each set's card count, for set-completion tracking.
+#   - PRICE ALERTS — an optional target price per watchlist card.
 # ---------------------------------------------------------------------------
 
 import os
@@ -61,7 +62,7 @@ ALLOWED_CONDITIONS = {
 
 clerk_client = Clerk(bearer_auth=CLERK_SECRET_KEY)
 
-app = FastAPI(title="Pokemon Card Price API", version="2.4")
+app = FastAPI(title="Pokemon Card Price API", version="2.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -148,6 +149,13 @@ def init_db() -> None:
         conn.execute(
             "ALTER TABLE watchlist ADD COLUMN quantity INTEGER NOT NULL " "DEFAULT 1"
         )
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+    # Add the 'target_price' column to watchlist if it isn't there yet.
+    # NULL means no price alert is set for that card.
+    try:
+        conn.execute("ALTER TABLE watchlist ADD COLUMN target_price REAL")
     except sqlite3.OperationalError:
         pass  # column already exists
 
@@ -549,6 +557,14 @@ class QuantityUpdateIn(BaseModel):
     quantity: int
 
 
+class TargetUpdateIn(BaseModel):
+    """The frontend sends this when the user sets or clears a price alert.
+    A target_price of null (or 0 or less) clears the alert."""
+
+    card_id: str
+    target_price: float | None = None
+
+
 # ---------------------------------------------------------------------------
 # ROUTES — search
 # ---------------------------------------------------------------------------
@@ -629,8 +645,14 @@ def price_history(card_id: str):
 
 @app.get("/watchlist")
 def get_watchlist(authorization: str | None = Header(default=None)):
-    """Return the signed-in user's watchlist — each card with its
-    condition and quantity owned."""
+    """
+    Return the signed-in user's watchlist.
+
+    Each card's price is the CURRENT price from the cards table (kept
+    fresh by searches) rather than the price frozen when the card was
+    added. Condition, quantity, and the price-alert target come from
+    the watchlist row.
+    """
     user_id = get_user_id(authorization)
 
     conn = sqlite3.connect(DATABASE)
@@ -638,8 +660,15 @@ def get_watchlist(authorization: str | None = Header(default=None)):
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT card_json, condition, quantity FROM watchlist "
-            "WHERE user_id = ? ORDER BY added_at",
+            """
+            SELECT w.card_json, w.condition, w.quantity, w.target_price,
+                   c.market_price AS current_price,
+                   c.last_updated AS price_updated
+            FROM watchlist w
+            LEFT JOIN cards c ON w.card_id = c.card_id
+            WHERE w.user_id = ?
+            ORDER BY w.added_at
+            """,
             (user_id,),
         )
         rows = cursor.fetchall()
@@ -651,6 +680,16 @@ def get_watchlist(authorization: str | None = Header(default=None)):
         card = json.loads(row["card_json"])
         card["condition"] = row["condition"]
         card["quantity"] = row["quantity"]
+        card["target_price"] = row["target_price"]
+
+        # Use the current price from the cards table when we have one;
+        # fall back to the price stored at add-time if we don't.
+        current = row["current_price"]
+        if current is not None and current > 0:
+            card["market_price"] = current
+        if row["price_updated"]:
+            card["last_updated"] = row["price_updated"]
+
         cards.append(card)
 
     return {"cards": cards, "count": len(cards)}
@@ -734,6 +773,42 @@ def update_quantity(
         "status": "updated",
         "card_id": payload.card_id,
         "quantity": quantity,
+    }
+
+
+@app.post("/watchlist/target")
+def update_target(
+    payload: TargetUpdateIn,
+    authorization: str | None = Header(default=None),
+):
+    """
+    Set or clear the price-alert target for one watchlist card.
+
+    A target_price of null, 0, or negative clears the alert (stores NULL).
+    Otherwise the alert triggers when the card's price reaches that value.
+    """
+    user_id = get_user_id(authorization)
+
+    # Anything that isn't a positive number means "no alert".
+    target = payload.target_price
+    if target is None or target <= 0:
+        target = None
+
+    conn = sqlite3.connect(DATABASE)
+    try:
+        conn.execute(
+            "UPDATE watchlist SET target_price = ? "
+            "WHERE user_id = ? AND card_id = ?",
+            (target, user_id, payload.card_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "status": "updated",
+        "card_id": payload.card_id,
+        "target_price": target,
     }
 
 

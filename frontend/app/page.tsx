@@ -154,6 +154,7 @@ interface WatchCard {
   large_image: string;
   condition?: string;
   quantity?: number;
+  target_price?: number | null;
 }
 
 export default function Home() {
@@ -178,6 +179,10 @@ export default function Home() {
   const [selectedCard, setSelectedCard] = useState<WatchCard | null>(null);
   const [watchlistLoading, setWatchlistLoading] = useState(false);
   const [conditionGuideOpen, setConditionGuideOpen] = useState(false);
+
+  // Price alert drafts — what the user has typed into a target-price box
+  // but not yet saved. Keyed by card_id so each card edits independently.
+  const [targetDrafts, setTargetDrafts] = useState<Record<string, string>>({});
 
   const { cards, loading, error } = useCards({
     search: searchTerm,
@@ -299,6 +304,82 @@ export default function Home() {
       alert('Could not save the quantity. Please try again.');
     }
   };
+
+  // --- PRICE ALERTS ---
+
+  // Save a card's target price — updates the screen, then the backend.
+  // Passing null clears the alert (the backend column is nullable).
+  const saveTarget = async (cardId: string, target: number | null) => {
+    setWatchlist((prev) =>
+      prev.map((c) =>
+        c.card_id === cardId ? { ...c, target_price: target } : c
+      )
+    );
+    // The draft is committed (or cleared), so drop it.
+    setTargetDrafts((prev) => {
+      const next = { ...prev };
+      delete next[cardId];
+      return next;
+    });
+    try {
+      const token = await getToken();
+      await fetch(`${API_URL}/watchlist/target`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ card_id: cardId, target_price: target }),
+      });
+    } catch {
+      alert('Could not save the price alert. Please try again.');
+    }
+  };
+
+  // Validate and submit whatever is typed in a card's target box.
+  const submitTargetDraft = (card: WatchCard) => {
+    const raw = (targetDrafts[card.card_id] ?? '').trim();
+    if (raw === '') {
+      // Empty box + Save = clear the alert.
+      saveTarget(card.card_id, null);
+      return;
+    }
+    const parsed = Number(raw);
+    if (Number.isNaN(parsed) || parsed <= 0) {
+      alert('Please enter a price above $0.');
+      return;
+    }
+    saveTarget(card.card_id, Number(parsed.toFixed(2)));
+  };
+
+  // What the target input should display: the in-progress draft if one
+  // exists, otherwise the saved target from the backend.
+  const targetInputValue = (card: WatchCard) => {
+    if (card.card_id in targetDrafts) return targetDrafts[card.card_id];
+    return card.target_price != null ? String(card.target_price) : '';
+  };
+
+  // True when the box's contents differ from what's saved — controls
+  // whether the Save button is shown.
+  const targetIsDirty = (card: WatchCard) => {
+    if (!(card.card_id in targetDrafts)) return false;
+    const saved = card.target_price != null ? String(card.target_price) : '';
+    return targetDrafts[card.card_id].trim() !== saved;
+  };
+
+  // A target counts as "reached" when the card has a live price at or
+  // above the target the user set.
+  const targetReached = (card: WatchCard) =>
+    card.target_price != null &&
+    card.market_price > 0 &&
+    card.market_price >= card.target_price;
+
+  // How many alerts are currently triggered — shown as a badge on the
+  // Watchlist button so it's visible without opening the panel.
+  const alertsHit = useMemo(
+    () => watchlist.filter((c) => targetReached(c)).length,
+    [watchlist]
+  );
 
   // Total value now multiplies each card's price by how many you own.
   const watchlistTotal = useMemo(
@@ -457,6 +538,12 @@ export default function Home() {
               <span className="text-xs px-2 py-0.5 rounded-full bg-yellow-400 text-black font-bold">
                 {watchlist.length}
               </span>
+              {/* Lights up when one or more price alerts have been reached */}
+              {alertsHit > 0 && (
+                <span className="text-xs px-2 py-0.5 rounded-full bg-green-400 text-black font-bold">
+                  🎯 {alertsHit}
+                </span>
+              )}
             </button>
           </div>
         </div>
@@ -807,6 +894,18 @@ export default function Home() {
             </p>
           ) : (
             <div>
+              {/* Alerts summary — only shown when at least one target is reached */}
+              {alertsHit > 0 && (
+                <div className="mb-4 bg-green-400/10 border border-green-400/30 rounded-xl p-3">
+                  <p className="text-green-400 text-sm font-semibold">
+                    🎯 {alertsHit} price {alertsHit === 1 ? 'alert' : 'alerts'} reached
+                  </p>
+                  <p className="text-zinc-400 text-xs mt-1">
+                    Cards marked below have hit your target price.
+                  </p>
+                </div>
+              )}
+
               {/* Condition guide — expandable reference */}
               <button
                 onClick={() => setConditionGuideOpen((o) => !o)}
@@ -829,10 +928,14 @@ export default function Home() {
               <div className="flex flex-col gap-3">
                 {watchlist.map((card) => {
                   const quantity = card.quantity ?? 1;
+                  const reached = targetReached(card);
                   return (
                     <div
                       key={card.card_id}
-                      className="bg-zinc-900 rounded-xl p-3 border border-zinc-800"
+                      className={
+                        'bg-zinc-900 rounded-xl p-3 border transition-colors ' +
+                        (reached ? 'border-green-400/50' : 'border-zinc-800')
+                      }
                     >
                       <div className="flex gap-3">
                         <img
@@ -921,6 +1024,81 @@ export default function Home() {
                             +
                           </button>
                         </div>
+                      </div>
+
+                      {/* Price alert target */}
+                      <div className="mt-3">
+                        <label className="text-zinc-500 text-xs">
+                          Price alert — flag when price reaches
+                        </label>
+                        <div className="flex gap-2 mt-1">
+                          <div className="relative flex-1">
+                            <span className="absolute left-3 top-1/2 -translate-y-1/2
+                                             text-zinc-500 text-sm pointer-events-none">
+                              $
+                            </span>
+                            <input
+                              type="number"
+                              min="0"
+                              step="0.01"
+                              placeholder="No alert set"
+                              value={targetInputValue(card)}
+                              onChange={(e) =>
+                                setTargetDrafts((prev) => ({
+                                  ...prev,
+                                  [card.card_id]: e.target.value,
+                                }))
+                              }
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') submitTargetDraft(card);
+                              }}
+                              className="w-full pl-7 pr-2 py-2 rounded-lg bg-zinc-950
+                                         border border-zinc-800 text-zinc-200 text-sm
+                                         focus:outline-none focus:border-yellow-500
+                                         transition-colors"
+                            />
+                          </div>
+
+                          {/* Save appears only when the box differs from what's saved */}
+                          {targetIsDirty(card) && (
+                            <button
+                              onClick={() => submitTargetDraft(card)}
+                              className="px-3 py-2 rounded-lg bg-yellow-400 hover:bg-yellow-300
+                                         text-black text-sm font-semibold transition-colors"
+                            >
+                              Save
+                            </button>
+                          )}
+
+                          {/* Clear appears only when an alert is saved */}
+                          {card.target_price != null && !targetIsDirty(card) && (
+                            <button
+                              onClick={() => saveTarget(card.card_id, null)}
+                              className="px-3 py-2 rounded-lg bg-zinc-950 border border-zinc-800
+                                         text-zinc-400 text-sm
+                                         hover:border-red-400 hover:text-red-400
+                                         transition-colors"
+                            >
+                              Clear
+                            </button>
+                          )}
+                        </div>
+
+                        {/* Alert status line */}
+                        {card.target_price != null && card.market_price > 0 && (
+                          reached ? (
+                            <p className="mt-2 text-xs font-semibold text-green-400">
+                              🎯 Target reached — now $
+                              {Number(card.market_price).toFixed(2)}, target $
+                              {Number(card.target_price).toFixed(2)}
+                            </p>
+                          ) : (
+                            <p className="mt-2 text-xs text-zinc-500">
+                              ${(card.target_price - card.market_price).toFixed(2)} below
+                              your ${Number(card.target_price).toFixed(2)} target
+                            </p>
+                          )
+                        )}
                       </div>
                     </div>
                   );
