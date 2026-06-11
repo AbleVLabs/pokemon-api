@@ -80,11 +80,22 @@ ALLOWED_CONDITIONS = {
 
 clerk_client = Clerk(bearer_auth=CLERK_SECRET_KEY)
 
-app = FastAPI(title="EtherDex API", version="3.3.2")
+app = FastAPI(title="EtherDex API", version="3.3.3")
+
+# Only EtherDex's own frontends may call this API from a browser.
+# (CORS protects users' browsers from other websites scripting our API
+# with their credentials — it is not a wall against direct requests.)
+ALLOWED_ORIGINS = [
+    "https://etherdex.ablevlabs.com",  # production frontend
+    "http://localhost:3000",  # local development
+    "http://127.0.0.1:3000",
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    # Vercel's own URLs for this project (production + preview deploys).
+    allow_origin_regex=r"https://etherdex-[a-z0-9-]+\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1466,7 +1477,7 @@ def root():
 def health():
     return {
         "status": "ok",
-        "version": "3.3.2",
+        "version": "3.3.3",
         "games": sorted(GAMES.keys()),
         "api_key_set": bool(API_KEY),
         "clerk_key_set": bool(CLERK_SECRET_KEY),
