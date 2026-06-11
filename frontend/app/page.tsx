@@ -53,6 +53,19 @@ const GAME_UI: Record<
     priceSource: 'Scryfall',
     tag: 'MTG',
   },
+  ygo: {
+    placeholder: 'Search any Yu-Gi-Oh! card (e.g. Dark Magician)...',
+    examples: [
+      'Dark Magician',
+      'Blue-Eyes White Dragon',
+      'Exodia the Forbidden One',
+      'Pot of Greed',
+      'Ash Blossom & Joyous Spring',
+    ],
+    rarities: ['Common', 'Rare', 'Super Rare', 'Ultra Rare', 'Secret Rare'],
+    priceSource: 'YGOPRODeck',
+    tag: 'YGO',
+  },
   default: {
     placeholder: 'Search any card...',
     examples: [],

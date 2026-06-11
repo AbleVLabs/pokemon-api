@@ -1,6 +1,6 @@
 # pokemon_api.py
 # ---------------------------------------------------------------------------
-# EtherDex — backend. (v3.1 — Pokémon + Magic: The Gathering)
+# EtherDex — backend. (v3.2 — Pokémon + MTG + Yu-Gi-Oh!)
 #
 # ARCHITECTURE NOTE (the Phase 1 refactor):
 # EtherDex now supports multiple card games through GAME ADAPTERS. Each
@@ -14,7 +14,7 @@
 # in SQLite keeps serving even when a source is down.
 #
 # Includes:
-#   - GAME ADAPTERS (Pokémon + MTG live; Yu-Gi-Oh, One Piece to come)
+#   - GAME ADAPTERS (Pokémon + MTG + Yu-Gi-Oh! live; One Piece to come)
 #   - Card search (per-game API + local DB cache, with freshness TTL)
 #   - Autocomplete name suggestions (Pokémon names; per-game later)
 #   - Per-user WATCHLIST, stored in the database, protected by Clerk auth
@@ -72,7 +72,7 @@ ALLOWED_CONDITIONS = {
 
 clerk_client = Clerk(bearer_auth=CLERK_SECRET_KEY)
 
-app = FastAPI(title="EtherDex API", version="3.1")
+app = FastAPI(title="EtherDex API", version="3.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -271,7 +271,7 @@ class MTGAdapter(GameAdapter):
     AUTOCOMPLETE_API = "https://api.scryfall.com/cards/autocomplete"
 
     HEADERS = {
-        "User-Agent": "EtherDex/3.1 (TCG collection tracker)",
+        "User-Agent": "EtherDex/3.2 (TCG collection tracker)",
         "Accept": "application/json",
     }
 
@@ -426,11 +426,178 @@ class MTGAdapter(GameAdapter):
             return []
 
 
+class YGOAdapter(GameAdapter):
+    """Yu-Gi-Oh!, via the YGOPRODeck API (free, no key).
+
+    YGOPRODeck returns one entry per card NAME with every printing in a
+    card_sets list — so this adapter expands each card into one row per
+    printing, matching how Pokémon and MTG cards are stored. A whole
+    search comes back in a single response (no pagination).
+    """
+
+    game = "ygo"
+    display_name = "Yu-Gi-Oh!"
+
+    CARDS_API = "https://db.ygoprodeck.com/api/v7/cardinfo.php"
+    SETS_API = "https://db.ygoprodeck.com/api/v7/cardsets.php"
+
+    HEADERS = {"User-Agent": "EtherDex/3.2 (TCG collection tracker)"}
+
+    @staticmethod
+    def _base_price(card: dict) -> float:
+        """Card-level price, used when a printing has no price of its own."""
+        prices = (card.get("card_prices") or [{}])[0]
+        for key in ("tcgplayer_price", "cardmarket_price", "ebay_price"):
+            value = prices.get(key)
+            if value:
+                try:
+                    price = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if price > 0:
+                    return price
+        return 0.0
+
+    def _expand_card(self, card: dict) -> list[dict]:
+        """One YGOPRODeck card entry -> one normalized row PER PRINTING."""
+        cid = card.get("id")
+        name = card.get("name")
+        if not cid or not name:
+            return []
+
+        images = (card.get("card_images") or [{}])[0]
+        small_image = images.get("image_url_small")
+        large_image = images.get("image_url")
+        fallback_price = self._base_price(card)
+
+        printings = card.get("card_sets") or []
+        if not printings:
+            # No set data yet (e.g. anime-only or unreleased) — one bare row.
+            return [
+                {
+                    "card_id": str(cid),
+                    "card_name": name,
+                    "set_name": None,
+                    "card_number": None,
+                    "rarity": None,
+                    "market_price": fallback_price,
+                    "small_image": small_image,
+                    "large_image": large_image,
+                }
+            ]
+
+        rows: list[dict] = []
+        seen: set[str] = set()
+        for s in printings:
+            set_code = s.get("set_code") or ""
+            # The same set_code can appear in several rarities, each its
+            # own collectible — fold the rarity code into the card id.
+            rarity_code = (s.get("set_rarity_code") or "").strip("()")
+            card_id = f"{cid}-{set_code}" + (f"-{rarity_code}" if rarity_code else "")
+            if card_id in seen:
+                continue
+            seen.add(card_id)
+
+            try:
+                price = float(s.get("set_price") or 0)
+            except (TypeError, ValueError):
+                price = 0.0
+            if price <= 0:
+                price = fallback_price
+
+            rows.append(
+                {
+                    "card_id": card_id,
+                    "card_name": name,
+                    "set_name": s.get("set_name"),
+                    "card_number": set_code,
+                    "rarity": s.get("set_rarity"),
+                    "market_price": price,
+                    "small_image": small_image,
+                    "large_image": large_image,
+                }
+            )
+        return rows
+
+    def search_cards(self, name: str) -> list[dict]:
+        rows: list[dict] = []
+        try:
+            response = requests.get(
+                self.CARDS_API,
+                params={"fname": name},
+                headers=self.HEADERS,
+                timeout=REQUEST_TIMEOUT,
+            )
+            # YGOPRODeck answers "no matches" with a 400 — that is an
+            # empty result, not an error.
+            if response.status_code == 400:
+                return []
+            response.raise_for_status()
+            data = response.json()
+        except requests.RequestException as e:
+            print(f"[{self.game}] API request failed: {e}")
+            return []
+        except ValueError as e:
+            print(f"[{self.game}] API returned invalid JSON: {e}")
+            return []
+
+        for card in data.get("data") or []:
+            rows.extend(self._expand_card(card))
+
+        print(f"  [{self.game}] fetched {len(rows)} printings")
+        return rows
+
+    def fetch_sets(self) -> list[dict]:
+        response = requests.get(
+            self.SETS_API,
+            headers=self.HEADERS,
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()  # a plain list of sets
+
+        rows: list[dict] = []
+        for s in data or []:
+            code = s.get("set_code")
+            if not code:
+                continue
+            rows.append(
+                {
+                    "set_id": code,
+                    "set_name": s.get("set_name"),
+                    "total": s.get("num_of_cards"),
+                    "printed_total": s.get("num_of_cards"),
+                    "release_date": s.get("tcg_date"),
+                }
+            )
+        return rows
+
+    def autocomplete(self, q: str) -> list[str]:
+        query = q.strip()
+        if len(query) < 2:
+            return []
+        try:
+            response = requests.get(
+                self.CARDS_API,
+                params={"fname": query, "num": 8, "offset": 0},
+                headers=self.HEADERS,
+                timeout=REQUEST_TIMEOUT,
+            )
+            if response.status_code == 400:
+                return []
+            response.raise_for_status()
+            names = [c.get("name") for c in response.json().get("data") or []]
+            return [n for n in names if n][:8]
+        except (requests.RequestException, ValueError):
+            return []
+
+
 # The registry of every game EtherDex knows. Adding a game later means
 # writing its adapter and adding one line here.
 GAMES: dict[str, GameAdapter] = {
     "pokemon": PokemonAdapter(),
     "mtg": MTGAdapter(),
+    "ygo": YGOAdapter(),
 }
 
 DEFAULT_GAME = "pokemon"
@@ -961,7 +1128,7 @@ def root():
 def health():
     return {
         "status": "ok",
-        "version": "3.1",
+        "version": "3.2",
         "games": sorted(GAMES.keys()),
         "api_key_set": bool(API_KEY),
         "clerk_key_set": bool(CLERK_SECRET_KEY),
