@@ -30,6 +30,8 @@ import csv
 import json
 import time
 import sqlite3
+import threading
+
 import requests
 from datetime import datetime, timedelta, timezone
 
@@ -72,7 +74,7 @@ ALLOWED_CONDITIONS = {
 
 clerk_client = Clerk(bearer_auth=CLERK_SECRET_KEY)
 
-app = FastAPI(title="EtherDex API", version="3.3")
+app = FastAPI(title="EtherDex API", version="3.3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1214,12 +1216,29 @@ def cards_need_full_sync(game: str) -> bool:
     return newest_dt < cutoff
 
 
+# One lock per full-sync game, so a search arriving while that game's
+# catalog is already downloading can't kick off a second download.
+_full_sync_locks: dict[str, threading.Lock] = {}
+
+
 def full_sync_cards(adapter: GameAdapter) -> int:
     """
     Sync a full-sync game's ENTIRE catalog into the local database,
     recording price snapshots, then fill in each set's card totals by
-    counting what was actually stored.
+    counting what was actually stored. Skips (without blocking) if a
+    sync for this game is already running.
     """
+    lock = _full_sync_locks.setdefault(adapter.game, threading.Lock())
+    if not lock.acquire(blocking=False):
+        print(f"[{adapter.game}] sync already running — serving what we have.")
+        return 0
+    try:
+        return _full_sync_cards_locked(adapter)
+    finally:
+        lock.release()
+
+
+def _full_sync_cards_locked(adapter: GameAdapter) -> int:
     print(f"[{adapter.game}] full catalog sync starting...")
     rows = adapter.fetch_all_cards()
     if not rows:
@@ -1364,10 +1383,23 @@ def sync_all_sets() -> None:
         print(f"[{adapter.game}] synced {len(rows)} sets.")
 
 
-# Sync set data once at startup (each game skips automatically if fresh),
-# then full catalogs for full-sync games (One Piece).
-sync_all_sets()
-sync_full_catalog_games()
+def _startup_sync() -> None:
+    """All startup syncing, run in the background: set lists for every
+    game, then full catalogs for full-sync games (One Piece)."""
+    try:
+        sync_all_sets()
+        sync_full_catalog_games()
+    except Exception as e:
+        print(f"[startup-sync] unexpected error: {e}")
+
+
+# The syncs run in a background thread so the API starts answering
+# IMMEDIATELY — searches serve cached data while catalogs fill in.
+# (Blocking startup on the One Piece download made the server
+# unreachable for a minute on first boot — a real-user trap.)
+threading.Thread(
+    target=_startup_sync, name="etherdex-startup-sync", daemon=True
+).start()
 
 
 # ---------------------------------------------------------------------------
@@ -1426,7 +1458,7 @@ def root():
 def health():
     return {
         "status": "ok",
-        "version": "3.3",
+        "version": "3.3.1",
         "games": sorted(GAMES.keys()),
         "api_key_set": bool(API_KEY),
         "clerk_key_set": bool(CLERK_SECRET_KEY),
