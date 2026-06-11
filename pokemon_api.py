@@ -40,7 +40,13 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-load_dotenv()
+# All file paths are anchored to this file's directory, so the app
+# behaves identically no matter what directory the server process is
+# started from — essential for deployment, where the working directory
+# is rarely the project folder.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 from clerk_backend_api import Clerk
 from clerk_backend_api.security.types import AuthenticateRequestOptions
@@ -50,7 +56,7 @@ import httpx
 # CONFIG
 # ---------------------------------------------------------------------------
 
-DATABASE = "pokemon_cards.db"
+DATABASE = os.path.join(BASE_DIR, "pokemon_cards.db")
 PAGE_SIZE = 250
 MAX_PAGES = 20
 REQUEST_TIMEOUT = 20
@@ -74,7 +80,7 @@ ALLOWED_CONDITIONS = {
 
 clerk_client = Clerk(bearer_auth=CLERK_SECRET_KEY)
 
-app = FastAPI(title="EtherDex API", version="3.3.1")
+app = FastAPI(title="EtherDex API", version="3.3.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -805,7 +811,9 @@ def load_pokemon_names() -> list[str]:
     names: list[str] = []
     seen = set()
     try:
-        with open("Pokemon.csv", newline="", encoding="utf-8") as f:
+        with open(
+            os.path.join(BASE_DIR, "Pokemon.csv"), newline="", encoding="utf-8"
+        ) as f:
             reader = csv.DictReader(f)
             for row in reader:
                 name = (row.get("Name") or "").strip()
@@ -1458,7 +1466,7 @@ def root():
 def health():
     return {
         "status": "ok",
-        "version": "3.3.1",
+        "version": "3.3.2",
         "games": sorted(GAMES.keys()),
         "api_key_set": bool(API_KEY),
         "clerk_key_set": bool(CLERK_SECRET_KEY),
