@@ -1,6 +1,6 @@
 # pokemon_api.py
 # ---------------------------------------------------------------------------
-# EtherDex — backend. (v3.2 — Pokémon + MTG + Yu-Gi-Oh!)
+# EtherDex — backend. (v3.3 — Pokémon + MTG + Yu-Gi-Oh! + One Piece)
 #
 # ARCHITECTURE NOTE (the Phase 1 refactor):
 # EtherDex now supports multiple card games through GAME ADAPTERS. Each
@@ -14,7 +14,7 @@
 # in SQLite keeps serving even when a source is down.
 #
 # Includes:
-#   - GAME ADAPTERS (Pokémon + MTG + Yu-Gi-Oh! live; One Piece to come)
+#   - GAME ADAPTERS — all four games live: Pokémon, MTG, Yu-Gi-Oh!, One Piece
 #   - Card search (per-game API + local DB cache, with freshness TTL)
 #   - Autocomplete name suggestions (Pokémon names; per-game later)
 #   - Per-user WATCHLIST, stored in the database, protected by Clerk auth
@@ -72,7 +72,7 @@ ALLOWED_CONDITIONS = {
 
 clerk_client = Clerk(bearer_auth=CLERK_SECRET_KEY)
 
-app = FastAPI(title="EtherDex API", version="3.2")
+app = FastAPI(title="EtherDex API", version="3.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -138,6 +138,15 @@ class GameAdapter:
         """Name suggestions for the search box. Optional — games
         without a suggestion source just return no suggestions."""
         return []
+
+    # "on_demand": cards are fetched per search (Pokémon, MTG, Yu-Gi-Oh).
+    # "full_sync": the WHOLE catalog is synced upfront and searches run
+    # entirely from the local database (One Piece).
+    sync_strategy: str = "on_demand"
+
+    def fetch_all_cards(self) -> list[dict]:
+        """Full-catalog fetch, only for sync_strategy='full_sync' games."""
+        raise NotImplementedError
 
 
 class PokemonAdapter(GameAdapter):
@@ -271,7 +280,7 @@ class MTGAdapter(GameAdapter):
     AUTOCOMPLETE_API = "https://api.scryfall.com/cards/autocomplete"
 
     HEADERS = {
-        "User-Agent": "EtherDex/3.2 (TCG collection tracker)",
+        "User-Agent": "EtherDex/3.3 (TCG collection tracker)",
         "Accept": "application/json",
     }
 
@@ -441,7 +450,7 @@ class YGOAdapter(GameAdapter):
     CARDS_API = "https://db.ygoprodeck.com/api/v7/cardinfo.php"
     SETS_API = "https://db.ygoprodeck.com/api/v7/cardsets.php"
 
-    HEADERS = {"User-Agent": "EtherDex/3.2 (TCG collection tracker)"}
+    HEADERS = {"User-Agent": "EtherDex/3.3 (TCG collection tracker)"}
 
     @staticmethod
     def _base_price(card: dict) -> float:
@@ -592,12 +601,181 @@ class YGOAdapter(GameAdapter):
             return []
 
 
+class OnePieceAdapter(GameAdapter):
+    """One Piece Card Game, via the community OPTCGAPI (free, no key).
+
+    There is no official Bandai API, and OPTCGAPI is set-based (no name
+    search) — so this adapter uses FULL-SYNC: the whole catalog (~20
+    main sets + ~28 starter decks, a few thousand cards) is synced into
+    the local database upfront, and every search runs locally. After the
+    first sync, One Piece works entirely from cache — if the source has
+    a bad day, EtherDex doesn't even notice.
+
+    Prices: OPTCGAPI scrapes TCGplayer market prices daily, so One Piece
+    ships WITH price data — and because the weekly sync covers the whole
+    catalog, it builds full price-snapshot history automatically.
+    (Schema validated against the live API on 2026-06-11.)
+    """
+
+    game = "onepiece"
+    display_name = "One Piece"
+    sync_strategy = "full_sync"
+
+    SETS_API = "https://optcgapi.com/api/allSets/"
+    DECKS_API = "https://optcgapi.com/api/allDecks/"
+    SET_CARDS_API = "https://optcgapi.com/api/sets/{sid}/"
+    DECK_CARDS_API = "https://optcgapi.com/api/decks/{sid}/"
+
+    HEADERS = {"User-Agent": "EtherDex/3.3 (TCG collection tracker)"}
+
+    RARITY_NAMES = {
+        "C": "Common",
+        "UC": "Uncommon",
+        "R": "Rare",
+        "SR": "Super Rare",
+        "SEC": "Secret Rare",
+        "L": "Leader",
+        "SP": "Special",
+        "P": "Promo",
+        "TR": "Treasure Rare",
+    }
+
+    def _fetch_json(self, url: str):
+        response = requests.get(url, headers=self.HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        return response.json()
+
+    def fetch_sets(self) -> list[dict]:
+        """Main sets + starter decks, normalized together. Card totals
+        are unknown here (the API doesn't list them) — the full catalog
+        sync fills them in by counting actual cards per set."""
+        rows: list[dict] = []
+        for s in self._fetch_json(self.SETS_API) or []:
+            set_id = s.get("set_id")
+            if set_id:
+                rows.append(
+                    {
+                        "set_id": set_id,
+                        "set_name": s.get("set_name"),
+                        "total": None,
+                        "printed_total": None,
+                        "release_date": None,
+                    }
+                )
+        time.sleep(0.1)
+        for d in self._fetch_json(self.DECKS_API) or []:
+            deck_id = d.get("structure_deck_id")
+            if deck_id:
+                rows.append(
+                    {
+                        "set_id": deck_id,
+                        "set_name": d.get("structure_deck_name"),
+                        "total": None,
+                        "printed_total": None,
+                        "release_date": None,
+                    }
+                )
+        return rows
+
+    def _normalize_card(self, c: dict) -> dict | None:
+        code = c.get("card_set_id")
+        name = c.get("card_name")
+        if not code or not name:
+            return None
+
+        # market_price first, inventory_price as the fallback.
+        price = 0.0
+        for key in ("market_price", "inventory_price"):
+            try:
+                value = float(c.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                price = value
+                break
+
+        image = c.get("card_image")
+        rarity = (c.get("rarity") or "").strip()
+        return {
+            # card_image_id distinguishes alternate arts when it differs
+            # from the plain card code.
+            "card_id": c.get("card_image_id") or code,
+            "card_name": name,
+            "set_name": c.get("set_name"),
+            "card_number": code,
+            "rarity": self.RARITY_NAMES.get(rarity, rarity),
+            "market_price": price,
+            "small_image": image,
+            "large_image": image,
+            # Internal: which set this row belongs to, for set totals.
+            "_set_id": c.get("set_id"),
+        }
+
+    def fetch_all_cards(self) -> list[dict]:
+        # Which sets and decks exist right now, from the live lists.
+        try:
+            set_ids = [s.get("set_id") for s in self._fetch_json(self.SETS_API) or []]
+            time.sleep(0.1)
+            deck_ids = [
+                d.get("structure_deck_id")
+                for d in self._fetch_json(self.DECKS_API) or []
+            ]
+        except (requests.RequestException, ValueError) as e:
+            print(f"[{self.game}] could not list sets/decks: {e}")
+            return []
+
+        targets = [(self.SET_CARDS_API, s) for s in set_ids if s]
+        targets += [(self.DECK_CARDS_API, d) for d in deck_ids if d]
+
+        rows: list[dict] = []
+        seen_ids: dict[str, int] = {}
+        consecutive_failures = 0
+
+        for template, sid in targets:
+            # If several requests in a row fail, the source is down —
+            # stop hammering it and serve whatever we already have.
+            if consecutive_failures >= 3:
+                print(f"[{self.game}] aborting sync — source looks down.")
+                break
+            try:
+                cards = self._fetch_json(template.format(sid=sid))
+                consecutive_failures = 0
+            except (requests.RequestException, ValueError) as e:
+                print(f"[{self.game}] failed to fetch {sid}: {e}")
+                consecutive_failures += 1
+                continue
+
+            for c in cards or []:
+                row = self._normalize_card(c)
+                if row is None:
+                    continue
+                # Alternate arts can share a card id — keep every
+                # printing by suffixing repeats.
+                cid = row["card_id"]
+                if cid in seen_ids:
+                    seen_ids[cid] += 1
+                    row["card_id"] = f"{cid}-alt{seen_ids[cid]}"
+                else:
+                    seen_ids[cid] = 1
+                rows.append(row)
+
+            print(f"  [{self.game}] {sid}: {len(cards or [])} cards")
+            time.sleep(0.1)
+
+        return rows
+
+    def autocomplete(self, q: str) -> list[str]:
+        # The whole catalog lives locally — suggest from our own DB.
+        return local_name_autocomplete(self.game, q)
+
+
 # The registry of every game EtherDex knows. Adding a game later means
 # writing its adapter and adding one line here.
 GAMES: dict[str, GameAdapter] = {
     "pokemon": PokemonAdapter(),
     "mtg": MTGAdapter(),
     "ygo": YGOAdapter(),
+    "onepiece": OnePieceAdapter(),
 }
 
 DEFAULT_GAME = "pokemon"
@@ -996,6 +1174,124 @@ def query_local_db(
         conn.close()
 
 
+def local_name_autocomplete(game: str, q: str) -> list[str]:
+    """Name suggestions straight from our own database — used by
+    full-sync games, whose whole catalog is already local."""
+    query = q.strip()
+    if not query:
+        return []
+    conn = sqlite3.connect(DATABASE)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT DISTINCT card_name FROM cards "
+            "WHERE game = ? AND card_name LIKE ? "
+            "ORDER BY card_name LIMIT 8",
+            (game, f"{query}%"),
+        )
+        return [row[0] for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def cards_need_full_sync(game: str) -> bool:
+    """True if a full-sync game's catalog is missing or stale."""
+    conn = sqlite3.connect(DATABASE)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT MAX(last_updated) FROM cards WHERE game = ?", (game,))
+        newest = cursor.fetchone()[0]
+    finally:
+        conn.close()
+
+    if not newest:
+        return True
+    try:
+        newest_dt = datetime.fromisoformat(newest)
+    except ValueError:
+        return True
+    cutoff = datetime.now(timezone.utc) - timedelta(days=FRESHNESS_DAYS)
+    return newest_dt < cutoff
+
+
+def full_sync_cards(adapter: GameAdapter) -> int:
+    """
+    Sync a full-sync game's ENTIRE catalog into the local database,
+    recording price snapshots, then fill in each set's card totals by
+    counting what was actually stored.
+    """
+    print(f"[{adapter.game}] full catalog sync starting...")
+    rows = adapter.fetch_all_cards()
+    if not rows:
+        print(f"[{adapter.game}] full sync got nothing (will retry next start).")
+        return 0
+
+    timestamp = _now_iso()
+    set_counts: dict[str, int] = {}
+
+    conn = sqlite3.connect(DATABASE)
+    try:
+        for row in rows:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO cards
+                (card_id, game, card_name, set_name, card_number,
+                 rarity, market_price, small_image, large_image,
+                 last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["card_id"],
+                    adapter.game,
+                    row["card_name"],
+                    row["set_name"],
+                    row["card_number"],
+                    row["rarity"],
+                    row["market_price"],
+                    row["small_image"],
+                    row["large_image"],
+                    timestamp,
+                ),
+            )
+            record_snapshot(conn, row["card_id"], row["market_price"])
+            set_id = row.get("_set_id")
+            if set_id:
+                set_counts[set_id] = set_counts.get(set_id, 0) + 1
+
+        # The sets list endpoint has no card counts — our own counts ARE
+        # the totals, since we just stored the whole catalog.
+        for set_id, count in set_counts.items():
+            conn.execute(
+                "UPDATE sets SET total = ?, printed_total = ? "
+                "WHERE game = ? AND set_id = ?",
+                (count, count, adapter.game, set_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    print(
+        f"[{adapter.game}] full sync stored {len(rows)} cards "
+        f"across {len(set_counts)} sets."
+    )
+    return len(rows)
+
+
+def sync_full_catalog_games() -> None:
+    """Startup catalog sync for full-sync games — isolated per adapter,
+    same rule as everywhere: one source failing never affects the rest."""
+    for adapter in GAMES.values():
+        if adapter.sync_strategy != "full_sync":
+            continue
+        if not cards_need_full_sync(adapter.game):
+            print(f"[{adapter.game}] catalog is fresh — skipping full sync.")
+            continue
+        try:
+            full_sync_cards(adapter)
+        except Exception as e:
+            print(f"[{adapter.game}] full sync failed (will retry next start): {e}")
+
+
 def sets_need_sync(game: str) -> bool:
     """True if this game's sets are missing or haven't synced recently."""
     conn = sqlite3.connect(DATABASE)
@@ -1068,8 +1364,10 @@ def sync_all_sets() -> None:
         print(f"[{adapter.game}] synced {len(rows)} sets.")
 
 
-# Sync set data once at startup (each game skips automatically if fresh).
+# Sync set data once at startup (each game skips automatically if fresh),
+# then full catalogs for full-sync games (One Piece).
 sync_all_sets()
+sync_full_catalog_games()
 
 
 # ---------------------------------------------------------------------------
@@ -1128,7 +1426,7 @@ def root():
 def health():
     return {
         "status": "ok",
-        "version": "3.2",
+        "version": "3.3",
         "games": sorted(GAMES.keys()),
         "api_key_set": bool(API_KEY),
         "clerk_key_set": bool(CLERK_SECRET_KEY),
@@ -1174,7 +1472,12 @@ def search_cards(
     if not name:
         return {"cards": []}
 
-    if is_data_fresh(adapter.game, name):
+    if adapter.sync_strategy == "full_sync":
+        # The whole catalog lives locally — resync only if it's missing
+        # or stale (self-heals if the startup sync had failed).
+        if cards_need_full_sync(adapter.game):
+            full_sync_cards(adapter)
+    elif is_data_fresh(adapter.game, name):
         print(f"[{adapter.game}] '{name}' — serving fresh data from DB.")
     else:
         print(f"[{adapter.game}] '{name}' — data missing or stale, fetching...")

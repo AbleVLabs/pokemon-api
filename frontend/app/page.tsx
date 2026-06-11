@@ -66,6 +66,19 @@ const GAME_UI: Record<
     priceSource: 'YGOPRODeck',
     tag: 'YGO',
   },
+  onepiece: {
+    placeholder: 'Search any One Piece card (e.g. Monkey D. Luffy)...',
+    examples: [
+      'Monkey D. Luffy',
+      'Roronoa Zoro',
+      'Nami',
+      'Shanks',
+      'Trafalgar Law',
+    ],
+    rarities: ['Common', 'Uncommon', 'Rare', 'Super Rare', 'Secret Rare', 'Leader'],
+    priceSource: 'TCGplayer via OPTCGAPI',
+    tag: 'OP',
+  },
   default: {
     placeholder: 'Search any card...',
     examples: [],

@@ -52,8 +52,15 @@ history recording + chart, mobile-responsive check, onboarding polish,
 **Price Alerts** (full feature: target input, Save/Clear, triggered
 highlights, panel banner, header badge — backend v2.5 + frontend).
 
-**In progress:** Multi-TCG refactor — Phase 1 (backend foundation:
-adapter architecture, game-tagged schema, v3.0) delivered.
+**Done (multi-TCG expansion, v3.0–v3.3):** TCG-agnostic refactor with
+game adapters and isolation boundaries, MTG via Scryfall, Yu-Gi-Oh via
+YGOPRODeck, One Piece via OPTCGAPI (full-sync strategy, validated
+against the live API), game switcher UI driven by the backend's /games
+endpoint, game-aware autocomplete and trust labels, mixed-game
+watchlist and dashboard.
+
+**In progress:** Launch prep — final QA pass across all four games,
+then ship free.
 
 ---
 
