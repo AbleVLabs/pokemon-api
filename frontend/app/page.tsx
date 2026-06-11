@@ -990,6 +990,13 @@ export default function Home() {
             <p className="text-zinc-600 text-xs">Research. Innovate. Create.</p>
           </div>
         </div>
+        <p className="max-w-3xl mx-auto px-6 pb-6 text-center text-zinc-700 text-[11px] leading-relaxed">
+          EtherDex is not affiliated with, endorsed, or sponsored by Nintendo,
+          The Pok&eacute;mon Company, Wizards of the Coast, Konami, Bandai, or
+          their affiliates. All card images, names, and related marks are the
+          property of their respective owners. Price data is provided for
+          informational purposes only.
+        </p>
       </footer>
 
       {/* WATCHLIST SLIDE-OUT PANEL */}
