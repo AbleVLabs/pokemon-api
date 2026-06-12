@@ -118,6 +118,193 @@ def locked_connect() -> LockedConnection:
     return LockedConnection()
 
 
+# ---------------------------------------------------------------------------
+# MYSQL SUPPORT (production)
+#
+# SQLite over PythonAnywhere's networked storage proved unreliable
+# under concurrent writes (launch-day incident: wedged and stale file
+# locks). Production therefore uses MySQL — the database the platform
+# is built around — while local development keeps zero-setup SQLite.
+# The switch is automatic: if MYSQL_DATABASE is set in the
+# environment, MySQL is used; otherwise SQLite.
+#
+# The wrapper below speaks the same dialect our code already speaks
+# (sqlite-style: conn.execute, "?" placeholders, INSERT OR REPLACE,
+# row_factory) and translates to MySQL on the fly, so every query in
+# this file works on both engines.
+# ---------------------------------------------------------------------------
+USE_MYSQL = bool(os.environ.get("MYSQL_DATABASE"))
+
+if USE_MYSQL:
+    import pymysql
+    import re as _re
+
+# MySQL reserves the word "condition" (a watchlist column of ours) —
+# it must be backtick-quoted in every statement.
+_MYSQL_RESERVED = ("condition",)
+
+
+def _to_mysql(sql: str) -> str:
+    """Translate one sqlite-dialect statement to MySQL."""
+    sql = sql.replace("INSERT OR REPLACE INTO", "REPLACE INTO")
+    sql = sql.replace("INSERT OR IGNORE INTO", "INSERT IGNORE INTO")
+    sql = sql.replace("?", "%s")
+    for word in _MYSQL_RESERVED:
+        sql = _re.sub(rf"(?<!`)\b{word}\b(?!`)", f"`{word}`", sql)
+    return sql
+
+
+class MySQLConnection:
+    """Mirrors the sqlite3 connection surface our code uses, backed by
+    PyMySQL. Opens per operation and closes promptly — exactly the
+    pattern PythonAnywhere's MySQL (which drops idle connections)
+    wants."""
+
+    def __init__(self):
+        object.__setattr__(self, "_dict_rows", False)
+        object.__setattr__(
+            self,
+            "_conn",
+            pymysql.connect(
+                host=os.environ.get("MYSQL_HOST", "127.0.0.1"),
+                user=os.environ.get("MYSQL_USER", ""),
+                password=os.environ.get("MYSQL_PASSWORD", ""),
+                database=os.environ.get("MYSQL_DATABASE", ""),
+                charset="utf8mb4",
+                autocommit=False,
+            ),
+        )
+
+    def __setattr__(self, name, value):
+        if name == "row_factory":
+            # sqlite3.Row requested -> dict-shaped rows from here on.
+            object.__setattr__(self, "_dict_rows", True)
+            return
+        setattr(object.__getattribute__(self, "_conn"), name, value)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_conn"), name)
+
+    def cursor(self):
+        conn = object.__getattribute__(self, "_conn")
+        if object.__getattribute__(self, "_dict_rows"):
+            base = conn.cursor(pymysql.cursors.DictCursor)
+        else:
+            base = conn.cursor()
+        return _TranslatingCursor(base)
+
+    def execute(self, sql, params=()):
+        cursor = self.cursor()
+        cursor.execute(sql, params)
+        return cursor
+
+    def commit(self):
+        object.__getattribute__(self, "_conn").commit()
+
+    def close(self):
+        object.__getattribute__(self, "_conn").close()
+
+
+class _TranslatingCursor:
+    """Cursor proxy that translates sqlite-dialect SQL to MySQL."""
+
+    def __init__(self, base):
+        self._base = base
+
+    def execute(self, sql, params=()):
+        self._base.execute(_to_mysql(sql), tuple(params))
+        return self
+
+    def fetchone(self):
+        return self._base.fetchone()
+
+    def fetchall(self):
+        return self._base.fetchall()
+
+    def __iter__(self):
+        return iter(self._base.fetchall())
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+
+def db_connect():
+    """The one way this app opens its database: MySQL in production
+    (MYSQL_DATABASE set), lock-serialized SQLite everywhere else."""
+    if USE_MYSQL:
+        return MySQLConnection()
+    return LockedConnection()
+
+
+MYSQL_SCHEMA = [
+    """
+    CREATE TABLE IF NOT EXISTS cards (
+        card_id       VARCHAR(191) PRIMARY KEY,
+        game          VARCHAR(32) NOT NULL DEFAULT 'pokemon',
+        card_name     VARCHAR(255),
+        set_name      VARCHAR(255),
+        card_number   VARCHAR(64),
+        rarity        VARCHAR(64),
+        market_price  DOUBLE,
+        small_image   TEXT,
+        large_image   TEXT,
+        last_updated  VARCHAR(40),
+        INDEX idx_card_name (card_name),
+        INDEX idx_cards_game (game)
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS watchlist (
+        user_id       VARCHAR(64) NOT NULL,
+        card_id       VARCHAR(191) NOT NULL,
+        card_json     TEXT NOT NULL,
+        added_at      VARCHAR(40) NOT NULL,
+        `condition`   VARCHAR(32) NOT NULL DEFAULT 'Near Mint',
+        quantity      INT NOT NULL DEFAULT 1,
+        target_price  DOUBLE,
+        game          VARCHAR(32) NOT NULL DEFAULT 'pokemon',
+        PRIMARY KEY (user_id, card_id),
+        INDEX idx_watchlist_user (user_id)
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS price_snapshots (
+        card_id        VARCHAR(191) NOT NULL,
+        snapshot_date  VARCHAR(16) NOT NULL,
+        market_price   DOUBLE NOT NULL,
+        PRIMARY KEY (card_id, snapshot_date),
+        INDEX idx_snapshot_card (card_id)
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS sets (
+        game           VARCHAR(32) NOT NULL DEFAULT 'pokemon',
+        set_id         VARCHAR(64) NOT NULL,
+        set_name       VARCHAR(255),
+        total          INT,
+        printed_total  INT,
+        release_date   VARCHAR(40),
+        last_synced    VARCHAR(40),
+        PRIMARY KEY (game, set_id),
+        INDEX idx_set_name (set_name)
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    """,
+]
+
+
+def init_db_mysql() -> None:
+    """Fresh-schema creation for MySQL. No migration archaeology needed:
+    this schema IS the current shape, and data arrives via the one-time
+    migration script."""
+    conn = db_connect()
+    try:
+        for statement in MYSQL_SCHEMA:
+            conn.execute(statement)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 PAGE_SIZE = 250
 MAX_PAGES = 20
 REQUEST_TIMEOUT = 20
@@ -141,7 +328,7 @@ ALLOWED_CONDITIONS = {
 
 clerk_client = Clerk(bearer_auth=CLERK_SECRET_KEY)
 
-app = FastAPI(title="EtherDex API", version="3.3.4")
+app = FastAPI(title="EtherDex API", version="3.4.0")
 
 # Only EtherDex's own frontends may call this API from a browser.
 # (CORS protects users' browsers from other websites scripting our API
@@ -912,6 +1099,9 @@ def init_db() -> None:
     run the v3.0 multi-game migrations on databases created by earlier
     versions. Every migration is safe and preserves existing data.
     """
+    if USE_MYSQL:
+        init_db_mysql()
+        return
     conn = locked_connect()
 
     # Cards cache table. One row per card, tagged with its game.
@@ -1136,7 +1326,7 @@ def record_snapshot(conn: sqlite3.Connection, card_id: str, price: float) -> Non
 
 def is_data_fresh(game: str, name: str) -> bool:
     """True if this game's cached cards matching the name are all fresh."""
-    conn = locked_connect()
+    conn = db_connect()
     try:
         cursor = conn.cursor()
         cursor.execute(
@@ -1169,7 +1359,7 @@ def refresh_cards(adapter: GameAdapter, name: str) -> int:
         return 0
 
     timestamp = _now_iso()
-    conn = locked_connect()
+    conn = db_connect()
     try:
         for row in rows:
             conn.execute(
@@ -1218,7 +1408,7 @@ def query_local_db(
     current frontend working unchanged through the refactor; the alias
     is dropped once the frontend moves to card_name in a later phase.
     """
-    conn = locked_connect()
+    conn = db_connect()
     conn.row_factory = sqlite3.Row
     try:
         query = """
@@ -1262,7 +1452,7 @@ def local_name_autocomplete(game: str, q: str) -> list[str]:
     query = q.strip()
     if not query:
         return []
-    conn = locked_connect()
+    conn = db_connect()
     try:
         cursor = conn.cursor()
         cursor.execute(
@@ -1278,7 +1468,7 @@ def local_name_autocomplete(game: str, q: str) -> list[str]:
 
 def cards_need_full_sync(game: str) -> bool:
     """True if a full-sync game's catalog is missing or stale."""
-    conn = locked_connect()
+    conn = db_connect()
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT MAX(last_updated) FROM cards WHERE game = ?", (game,))
@@ -1328,7 +1518,7 @@ def _full_sync_cards_locked(adapter: GameAdapter) -> int:
     timestamp = _now_iso()
     set_counts: dict[str, int] = {}
 
-    conn = locked_connect()
+    conn = db_connect()
     try:
         stored = 0
         for row in rows:
@@ -1399,7 +1589,7 @@ def sync_full_catalog_games() -> None:
 
 def sets_need_sync(game: str) -> bool:
     """True if this game's sets are missing or haven't synced recently."""
-    conn = locked_connect()
+    conn = db_connect()
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT MAX(last_synced) FROM sets WHERE game = ?", (game,))
@@ -1442,7 +1632,7 @@ def sync_all_sets() -> None:
             continue
 
         timestamp = _now_iso()
-        conn = locked_connect()
+        conn = db_connect()
         try:
             for row in rows:
                 conn.execute(
@@ -1544,10 +1734,11 @@ def root():
 def health():
     return {
         "status": "ok",
-        "version": "3.3.4",
+        "version": "3.4.0",
         "games": sorted(GAMES.keys()),
         "api_key_set": bool(API_KEY),
         "clerk_key_set": bool(CLERK_SECRET_KEY),
+        "database": "mysql" if USE_MYSQL else "sqlite",
         "freshness_days": FRESHNESS_DAYS,
     }
 
@@ -1608,7 +1799,7 @@ def search_cards(
 @app.get("/price-history/{card_id}")
 def price_history(card_id: str):
     """Return the recorded price snapshots for one card, oldest first."""
-    conn = locked_connect()
+    conn = db_connect()
     conn.row_factory = sqlite3.Row
     try:
         cursor = conn.cursor()
@@ -1645,7 +1836,7 @@ def get_watchlist(authorization: str | None = Header(default=None)):
     """
     user_id = get_user_id(authorization)
 
-    conn = locked_connect()
+    conn = db_connect()
     conn.row_factory = sqlite3.Row
     try:
         cursor = conn.cursor()
@@ -1702,7 +1893,7 @@ def add_to_watchlist(
     # Validate the game (defaults to pokemon for the current frontend).
     adapter = get_adapter(card.game)
 
-    conn = locked_connect()
+    conn = db_connect()
     try:
         conn.execute(
             """
@@ -1730,7 +1921,7 @@ def update_condition(
     if payload.condition not in ALLOWED_CONDITIONS:
         raise HTTPException(status_code=400, detail="Invalid condition.")
 
-    conn = locked_connect()
+    conn = db_connect()
     try:
         conn.execute(
             "UPDATE watchlist SET condition = ? " "WHERE user_id = ? AND card_id = ?",
@@ -1758,7 +1949,7 @@ def update_quantity(
     # Quantity can't go negative. Clamp anything below 0 up to 0.
     quantity = max(0, payload.quantity)
 
-    conn = locked_connect()
+    conn = db_connect()
     try:
         conn.execute(
             "UPDATE watchlist SET quantity = ? " "WHERE user_id = ? AND card_id = ?",
@@ -1793,7 +1984,7 @@ def update_target(
     if target is None or target <= 0:
         target = None
 
-    conn = locked_connect()
+    conn = db_connect()
     try:
         conn.execute(
             "UPDATE watchlist SET target_price = ? "
@@ -1828,7 +2019,7 @@ def collection_history(authorization: str | None = Header(default=None)):
     """
     user_id = get_user_id(authorization)
 
-    conn = locked_connect()
+    conn = db_connect()
     conn.row_factory = sqlite3.Row
     try:
         cursor = conn.cursor()
@@ -1934,7 +2125,7 @@ def collection_sets(authorization: str | None = Header(default=None)):
     """
     user_id = get_user_id(authorization)
 
-    conn = locked_connect()
+    conn = db_connect()
     conn.row_factory = sqlite3.Row
     try:
         cursor = conn.cursor()
@@ -2009,7 +2200,7 @@ def remove_from_watchlist(
     """Remove a card from the signed-in user's watchlist."""
     user_id = get_user_id(authorization)
 
-    conn = locked_connect()
+    conn = db_connect()
     try:
         conn.execute(
             "DELETE FROM watchlist WHERE user_id = ? AND card_id = ?",

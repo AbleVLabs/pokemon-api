@@ -4,3 +4,4 @@ requests
 python-dotenv
 clerk-backend-api
 httpx
+pymysql
