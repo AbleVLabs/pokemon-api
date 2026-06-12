@@ -26,11 +26,21 @@
 # ---------------------------------------------------------------------------
 
 import os
+import sys
 import csv
 import json
 import time
 import sqlite3
 import threading
+
+# Make print() output appear in server logs immediately, no matter how
+# the process is launched (uvicorn under hosting platforms buffers
+# stdout otherwise — learned the hard way, twice).
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 
 import requests
 from datetime import datetime, timedelta, timezone
@@ -57,6 +67,57 @@ import httpx
 # ---------------------------------------------------------------------------
 
 DATABASE = os.path.join(BASE_DIR, "pokemon_cards.db")
+
+# ---------------------------------------------------------------------------
+# DATABASE ACCESS SERIALIZATION
+#
+# SQLite over networked storage (like PythonAnywhere's) handles
+# concurrent access badly: a write racing a read can wedge a lock
+# forever, taking the whole API down (this happened in production on
+# launch day). The fix: the app takes turns with its own database.
+# One global lock means no two operations ever touch SQLite at the
+# same instant. Database work takes milliseconds, and all slow network
+# fetches happen OUTSIDE database transactions, so requests queue
+# invisibly instead of crashing.
+# ---------------------------------------------------------------------------
+DB_LOCK = threading.RLock()
+
+
+class LockedConnection:
+    """A sqlite3 connection that holds the global DB lock for its
+    whole lifetime. Acquired on open, released on close — and every
+    call site closes in a finally block."""
+
+    def __init__(self):
+        DB_LOCK.acquire()
+        try:
+            object.__setattr__(self, "_conn", sqlite3.connect(DATABASE, timeout=30))
+        except BaseException:
+            DB_LOCK.release()
+            raise
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_conn"), name)
+
+    def __setattr__(self, name, value):
+        # Forward attribute assignment (like row_factory) to the real
+        # connection — otherwise settings silently land on the wrapper.
+        setattr(object.__getattribute__(self, "_conn"), name, value)
+
+    def close(self):
+        try:
+            self._conn.close()
+        finally:
+            try:
+                DB_LOCK.release()
+            except RuntimeError:
+                pass
+
+
+def locked_connect() -> LockedConnection:
+    return LockedConnection()
+
+
 PAGE_SIZE = 250
 MAX_PAGES = 20
 REQUEST_TIMEOUT = 20
@@ -80,7 +141,7 @@ ALLOWED_CONDITIONS = {
 
 clerk_client = Clerk(bearer_auth=CLERK_SECRET_KEY)
 
-app = FastAPI(title="EtherDex API", version="3.3.3")
+app = FastAPI(title="EtherDex API", version="3.3.4")
 
 # Only EtherDex's own frontends may call this API from a browser.
 # (CORS protects users' browsers from other websites scripting our API
@@ -851,7 +912,7 @@ def init_db() -> None:
     run the v3.0 multi-game migrations on databases created by earlier
     versions. Every migration is safe and preserves existing data.
     """
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
 
     # Cards cache table. One row per card, tagged with its game.
     # Note on the primary key: card_id formats can't collide across our
@@ -1075,7 +1136,7 @@ def record_snapshot(conn: sqlite3.Connection, card_id: str, price: float) -> Non
 
 def is_data_fresh(game: str, name: str) -> bool:
     """True if this game's cached cards matching the name are all fresh."""
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
     try:
         cursor = conn.cursor()
         cursor.execute(
@@ -1108,7 +1169,7 @@ def refresh_cards(adapter: GameAdapter, name: str) -> int:
         return 0
 
     timestamp = _now_iso()
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
     try:
         for row in rows:
             conn.execute(
@@ -1157,7 +1218,7 @@ def query_local_db(
     current frontend working unchanged through the refactor; the alias
     is dropped once the frontend moves to card_name in a later phase.
     """
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
     conn.row_factory = sqlite3.Row
     try:
         query = """
@@ -1201,7 +1262,7 @@ def local_name_autocomplete(game: str, q: str) -> list[str]:
     query = q.strip()
     if not query:
         return []
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
     try:
         cursor = conn.cursor()
         cursor.execute(
@@ -1217,7 +1278,7 @@ def local_name_autocomplete(game: str, q: str) -> list[str]:
 
 def cards_need_full_sync(game: str) -> bool:
     """True if a full-sync game's catalog is missing or stale."""
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT MAX(last_updated) FROM cards WHERE game = ?", (game,))
@@ -1267,8 +1328,9 @@ def _full_sync_cards_locked(adapter: GameAdapter) -> int:
     timestamp = _now_iso()
     set_counts: dict[str, int] = {}
 
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
     try:
+        stored = 0
         for row in rows:
             conn.execute(
                 """
@@ -1295,6 +1357,11 @@ def _full_sync_cards_locked(adapter: GameAdapter) -> int:
             set_id = row.get("_set_id")
             if set_id:
                 set_counts[set_id] = set_counts.get(set_id, 0) + 1
+            # Commit in small batches: short write transactions are far
+            # kinder to networked storage than one giant one.
+            stored += 1
+            if stored % 300 == 0:
+                conn.commit()
 
         # The sets list endpoint has no card counts — our own counts ARE
         # the totals, since we just stored the whole catalog.
@@ -1332,7 +1399,7 @@ def sync_full_catalog_games() -> None:
 
 def sets_need_sync(game: str) -> bool:
     """True if this game's sets are missing or haven't synced recently."""
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT MAX(last_synced) FROM sets WHERE game = ?", (game,))
@@ -1375,7 +1442,7 @@ def sync_all_sets() -> None:
             continue
 
         timestamp = _now_iso()
-        conn = sqlite3.connect(DATABASE)
+        conn = locked_connect()
         try:
             for row in rows:
                 conn.execute(
@@ -1477,7 +1544,7 @@ def root():
 def health():
     return {
         "status": "ok",
-        "version": "3.3.3",
+        "version": "3.3.4",
         "games": sorted(GAMES.keys()),
         "api_key_set": bool(API_KEY),
         "clerk_key_set": bool(CLERK_SECRET_KEY),
@@ -1541,7 +1608,7 @@ def search_cards(
 @app.get("/price-history/{card_id}")
 def price_history(card_id: str):
     """Return the recorded price snapshots for one card, oldest first."""
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
     conn.row_factory = sqlite3.Row
     try:
         cursor = conn.cursor()
@@ -1578,7 +1645,7 @@ def get_watchlist(authorization: str | None = Header(default=None)):
     """
     user_id = get_user_id(authorization)
 
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
     conn.row_factory = sqlite3.Row
     try:
         cursor = conn.cursor()
@@ -1635,7 +1702,7 @@ def add_to_watchlist(
     # Validate the game (defaults to pokemon for the current frontend).
     adapter = get_adapter(card.game)
 
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
     try:
         conn.execute(
             """
@@ -1663,7 +1730,7 @@ def update_condition(
     if payload.condition not in ALLOWED_CONDITIONS:
         raise HTTPException(status_code=400, detail="Invalid condition.")
 
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
     try:
         conn.execute(
             "UPDATE watchlist SET condition = ? " "WHERE user_id = ? AND card_id = ?",
@@ -1691,7 +1758,7 @@ def update_quantity(
     # Quantity can't go negative. Clamp anything below 0 up to 0.
     quantity = max(0, payload.quantity)
 
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
     try:
         conn.execute(
             "UPDATE watchlist SET quantity = ? " "WHERE user_id = ? AND card_id = ?",
@@ -1726,7 +1793,7 @@ def update_target(
     if target is None or target <= 0:
         target = None
 
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
     try:
         conn.execute(
             "UPDATE watchlist SET target_price = ? "
@@ -1761,7 +1828,7 @@ def collection_history(authorization: str | None = Header(default=None)):
     """
     user_id = get_user_id(authorization)
 
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
     conn.row_factory = sqlite3.Row
     try:
         cursor = conn.cursor()
@@ -1867,7 +1934,7 @@ def collection_sets(authorization: str | None = Header(default=None)):
     """
     user_id = get_user_id(authorization)
 
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
     conn.row_factory = sqlite3.Row
     try:
         cursor = conn.cursor()
@@ -1942,7 +2009,7 @@ def remove_from_watchlist(
     """Remove a card from the signed-in user's watchlist."""
     user_id = get_user_id(authorization)
 
-    conn = sqlite3.connect(DATABASE)
+    conn = locked_connect()
     try:
         conn.execute(
             "DELETE FROM watchlist WHERE user_id = ? AND card_id = ?",
